@@ -21,9 +21,18 @@ export function assessLaunch({site='carrum-foreshore', activity='fishing', offic
   else missing.push('Verified Port Phillip warning state');
 
   if (!notices || ['unavailable','stale'].includes(notices.status)) missing.push('Fresh Parks Victoria local notice check');
-  else if (notices.status === 'review_required' || (notices.unresolved_count || 0) > 0) {
-    const ids=(notices.notices || []).filter(n=>n.temporary || !n.detail_verified).map(n=>n.number);
-    blockers.push(`Local navigation notice requires review${ids.length ? ': ' + ids.join(', ') : ''} (not necessarily a launch closure)`);
+  else if (notices.status === 'blocking_notice') {
+    const ids=(notices.notices || []).filter(n=>n.assessment==='blocking').map(n=>n.number);
+    blockers.push(`Local navigation restriction/hazard requires review${ids.length ? ': ' + ids.join(', ') : ''}`);
+  }
+  else if (notices.status === 'review_required') {
+    const ids=(notices.notices || []).filter(n=>n.assessment==='review' || !n.detail_verified).map(n=>n.number);
+    blockers.push(`Local navigation notice requires review${ids.length ? ': ' + ids.join(', ') : ''} (classification not confirmed)`);
+  }
+  else if (notices.status === 'caution_notice') {
+    const ids=(notices.notices || []).filter(n=>n.assessment==='caution').map(n=>n.number);
+    cautions.push(`Local navigation advisory${ids.length ? ': ' + ids.join(', ') : ''}`);
+    passed.push('No blocking local notice found in recent Parks Victoria listing');
   }
   else if (notices.status === 'no_unresolved_in_recent_listing') passed.push('No unresolved local notice found in recent Parks Victoria listing');
   else missing.push('Resolved local notice state');

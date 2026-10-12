@@ -71,6 +71,16 @@ def candidates_on_page(html):
             found[number] = (url, label)
     return found
 
+
+def classify_notice(text):
+    # Classification is deliberately conservative. Only explicit closure,
+    # exclusion, depth/entrance or obstruction language becomes a hard block.
+    if re.search(r'(?i)\b(?:closed|closure|prohibited|exclusion zone|do not enter|unsafe to navigate|shoal(?:ing)?|insufficient depth|reduced depth|dredg(?:ing|e)|obstruction|navigation hazard)\b', text):
+        return 'blocking'
+    if re.search(r'(?i)\b(?:missing|unlit|damaged|off station|unserviceable)\b.{0,80}\b(?:buoy|beacon|navigation mark|special mark|light)\b|\b(?:buoy|beacon|navigation mark|special mark|light)\b.{0,80}\b(?:missing|unlit|damaged|off station|unserviceable)\b', text):
+        return 'caution'
+    return 'review'
+
 def main():
     token = os.environ.get('BOM_INGEST_TOKEN')
     if not token:
@@ -119,6 +129,7 @@ def main():
             'cancels': cancels,
             'category': ('carrum' if re.search(r'\bCarrum\b', relevant_text, re.I) else 'patterson' if re.search(r'Patterson\s+River', relevant_text, re.I) else 'mordialloc' if re.search(r'\bMordialloc\b', relevant_text, re.I) else 'nearby'),
             'detail_verified': True,
+            'assessment': classify_notice(relevant_text),
             '_relevant': relevant,
         })
 
