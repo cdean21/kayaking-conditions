@@ -161,6 +161,170 @@ function opportunityScore(run,quality){
   return Math.max(0,Math.min(100,Math.round(base-peak('gust')*.35-peak('wave_m')*8)));
 }
 
+function activityFitScore(o) {
+  const d=o.details||{};
+  const wind=Number(d.mean_wind_kn);
+  const gust=Number(d.peak_gust_kn);
+  const wave=Number(d.max_wave_m);
+  let fit=0;
+
+  if(o.activity==='sailing'){
+    if(Number.isFinite(wind)&&wind>=8&&wind<=20) fit+=5;
+    if(Number.isFinite(wind)&&wind>=10&&wind<=16) fit+=2;
+    if(Number.isFinite(wave)&&wave<=0.7) fit+=2;
+    if(Number.isFinite(gust)&&gust<=24) fit+=1;
+  } else if(o.activity==='fishing'){
+    if(Number.isFinite(wind)&&wind<=10) fit+=5;
+    if(Number.isFinite(wave)&&wave<=0.4) fit+=3;
+    if(Number.isFinite(gust)&&gust<=15) fit+=1;
+  } else if(o.activity==='kayaking'){
+    if(Number.isFinite(wind)&&wind<=12) fit+=5;
+    if(Number.isFinite(wave)&&wave<=0.4) fit+=3;
+    if(Number.isFinite(gust)&&gust<=16) fit+=1;
+  }
+
+  return fit;
+}
+
+function recommendationRank(o) {
+  const d=o.details||{};
+  const hourly=d.hourly||[];
+  const underlyingPreferred=hourly.filter(
+    h=>h.assessment_status==='preferred'
+  ).length;
+
+  return (
+    (d.classification==='preferred'?100000:50000) +
+    underlyingPreferred*5000 +
+    activityFitScore(o)*500 +
+    (Number(d.duration_hours)||0)*100 -
+    (Number(d.peak_gust_kn)||0) -
+    (Number(d.max_wave_m)||0)*10 -
+    (d.advisories||[]).length*100
+  );
+}
+
+function activityRecommendationReason(o) {
+  const d=o.details||{};
+  const wind=Number(d.mean_wind_kn);
+  const gust=Number(d.peak_gust_kn);
+  const wave=Number(d.max_wave_m);
+
+  const conditions=[
+    Number.isFinite(wind)?`${wind.toFixed(1)} kt mean wind`:null,
+    Number.isFinite(gust)?`gusts to ${gust.toFixed(1)} kt`:null,
+    Number.isFinite(wave)?`modelled waves to ${wave.toFixed(2)} m`:null
+  ].filter(Boolean).join(', ');
+
+  if(o.activity==='sailing')
+    return `${conditions}. These conditions fit sailing better than fishing or paddling.`;
+
+  if(o.activity==='fishing')
+    return `${conditions}. The lighter wind and sea state favour fishing over the other activities.`;
+
+  return `${conditions}. These conditions favour paddling over the other activities.`;
+}
+
+function bestSpeciesForWindow(o,data,tides,official,noticesBySite) {
+  if(o.activity!=='fishing') return null;
+
+  const timeline=buildBiteTimeline({
+    weather:data.weather,
+    marine:data.marine,
+    checkedAt:o.details?.forecast_checked_at||data.checkedAt,
+    tides,
+    site:o.site_id,
+    now:o.starts_at,
+    limit:Math.ceil(hours(o.starts_at,o.ends_at)),
+    launchContext:{
+      official,
+      notices:noticesBySite[o.site_id]
+    }
+  });
+
+  const start=Date.parse(o.starts_at);
+  const end=Date.parse(o.ends_at);
+  const relevant=(timeline.hours||[]).filter(h=>{
+    const t=Date.parse(h.time);
+    return t>=start&&t<end;
+  });
+
+  const species=new Map();
+
+  for(const h of relevant){
+    for(const s of h.species||[]){
+      if(!Number.isFinite(Number(s.score))) continue;
+      if(!species.has(s.id)){
+        species.set(s.id,{
+          id:s.id,
+          name:s.name,
+          scores:[],
+          priority:Number(s.priority)||999
+        });
+      }
+      species.get(s.id).scores.push(Number(s.score));
+    }
+  }
+
+  const ranked=[...species.values()].map(s=>({
+    id:s.id,
+    name:s.name,
+    mean_score:+(
+      s.scores.reduce((a,b)=>a+b,0)/s.scores.length
+    ).toFixed(1),
+    peak_score:Math.max(...s.scores),
+    priority:s.priority
+  })).sort((a,b)=>
+    b.mean_score-a.mean_score ||
+    b.peak_score-a.peak_score ||
+    a.priority-b.priority
+  );
+
+  return ranked[0]||null;
+}
+
+function annotateRecommendations(opportunities,data,official,noticesBySite,tides) {
+  const groups=new Map();
+
+  for(const o of opportunities){
+    // One recommendation per available Melbourne-local day, across both
+    // launch sites and all activities. This prevents duplicate positive
+    // alerts for Carrum and Patterson for effectively the same outing.
+    const key=localDateKey(o.starts_at);
+    if(!groups.has(key)) groups.set(key,[]);
+    groups.get(key).push(o);
+  }
+
+  for(const group of groups.values()){
+    const winner=[...group].sort((a,b)=>
+      recommendationRank(b)-recommendationRank(a) ||
+      Date.parse(a.starts_at)-Date.parse(b.starts_at)
+    )[0];
+
+    if(!winner) continue;
+
+    const species=bestSpeciesForWindow(
+      winner,data,tides,official,noticesBySite
+    );
+
+    for(const o of group){
+      o.details.recommendation={
+        best_activity:winner.activity,
+        best_activity_label:activityLabel(winner.activity),
+        best_site_id:winner.site_id,
+        best_starts_at:winner.starts_at,
+        best_ends_at:winner.ends_at,
+        is_best_activity:o===winner,
+        is_best_outing:o===winner,
+        reason:activityRecommendationReason(winner),
+        best_species:species
+      };
+    }
+  }
+
+  return opportunities;
+}
+
 function bomPeriodAt(official, at){
   const t=Date.parse(at);
   return (official?.forecast?.periods||[]).find(p=>{
@@ -282,7 +446,13 @@ function buildOpportunities(data, official, noticesBySite, tides=[], forecastChe
     }
     flush();
   }
-  return result;
+  return annotateRecommendations(
+    result,
+    data,
+    official,
+    noticesBySite,
+    tides
+  );
 }
 function localDateKey(iso){
   return new Intl.DateTimeFormat('en-CA',{timeZone:'Australia/Melbourne',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(iso));
@@ -306,6 +476,8 @@ function matchPrior(o,rows,used){
 function classifyChange(prior,o){
   const pd=parseDetails(prior), nd=o.details||{};
   const oldClass=pd.classification||'marginal', newClass=nd.classification||'marginal';
+
+
   const oldDur=hours(prior.starts_at,prior.ends_at), newDur=hours(o.starts_at,o.ends_at);
   const startShift=(Date.parse(o.starts_at)-Date.parse(prior.starts_at))/3600000;
   const endShift=(Date.parse(o.ends_at)-Date.parse(prior.ends_at))/3600000;
@@ -414,13 +586,43 @@ function formatAlert(eventType,payload){
   const tide=tideSummary(d);
   const arrival=(d.arrival_checks||[])[0];
   const caveat=(d.bom_cross_check||[])[0];
+  const rec=d.recommendation||{};
+  const species=rec.best_species||null;
   let title,lead;
   if(eventType==='NEW_OPPORTUNITY'){
-    title=`Hobie: new ${activity.toLowerCase()} window`;
-    lead=`New ${d.classification||'qualifying'} forecast opportunity at ${site}: ${window}.`;
+    if(rec.is_best_activity){
+      title=activity==='Fishing'&&species
+        ? `Hobie: fishing looks best — ${species.name}`
+        : `Hobie: ${activity.toLowerCase()} is the best fit`;
+
+      lead=`${activity} is the best forecast fit at ${site}: ${window}.`;
+
+      if(rec.reason) lead+=` ${rec.reason}`;
+
+      if(activity==='Fishing'&&species){
+        lead+=` Best target: ${species.name} — average suitability ${species.mean_score}/100, peak ${species.peak_score}/100 during this window.`;
+      }
+    } else {
+      title=`Hobie: new ${activity.toLowerCase()} window`;
+      lead=`New ${d.classification||'qualifying'} forecast opportunity at ${site}: ${window}.`;
+    }
   } else if(eventType==='IMPROVED'){
-    title=`Hobie: ${activity.toLowerCase()} window improved`;
-    lead=`Forecast opportunity at ${site} has improved: ${window}${d.classification?` (${d.classification})`:''}.`;
+    if(rec.is_best_activity){
+      title=activity==='Fishing'&&species
+        ? `Hobie: fishing now looks best — ${species.name}`
+        : `Hobie: ${activity.toLowerCase()} now looks best`;
+
+      lead=`${activity} is now the best forecast fit at ${site}: ${window}.`;
+
+      if(rec.reason) lead+=` ${rec.reason}`;
+
+      if(activity==='Fishing'&&species){
+        lead+=` Best target: ${species.name} — average suitability ${species.mean_score}/100, peak ${species.peak_score}/100 during this window.`;
+      }
+    } else {
+      title=`Hobie: ${activity.toLowerCase()} window improved`;
+      lead=`Forecast opportunity at ${site} has improved: ${window}${d.classification?` (${d.classification})`:''}.`;
+    }
   } else if(eventType==='DETERIORATING'){
     title=`Hobie: ${activity.toLowerCase()} window deteriorating`;
     const oldClass=previous?.details?.classification, newClass=d.classification;
@@ -443,6 +645,15 @@ async function positiveAlertGate(env,row,details){
   const candidate=await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE opportunity_key=? AND status='candidate' AND ends_at > ?").bind(row.opportunity_key,stamp()).first();
   if(!candidate) return {ok:false,permanent:true,reason:'opportunity is no longer current'};
   const currentDetails=parseDetails(candidate);
+
+  if(currentDetails.recommendation?.is_best_activity!==true){
+    return {
+      ok:false,
+      permanent:true,
+      reason:'another activity is the better recommendation for this outing'
+    };
+  }
+
   const forecastAt=Date.parse(currentDetails.forecast_checked_at||'');
   if(!Number.isFinite(forecastAt)||Date.now()-forecastAt>FORECAST_MAX_AGE_MS) return {ok:false,permanent:false,reason:'numerical forecast is stale'};
   const official=await readOfficialMarineSnapshot(env);
