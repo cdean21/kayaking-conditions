@@ -43,9 +43,42 @@ function daylight(date, sunrise, sunset) {
 }
 function apiUrl(base, args) { const u = new URL(base); Object.entries(args).forEach(([k,v]) => u.searchParams.set(k,String(v))); return u; }
 async function fetchJson(url) {
-  const r = await fetch(url, { headers: { 'user-agent': 'kayaking-conditions/0.1' }, signal: AbortSignal.timeout(15000) });
-  if (!r.ok) throw new Error(`${new URL(url).host}: HTTP ${r.status}`);
-  return r.json();
+  const host = new URL(url).host;
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const r = await fetch(url, {
+        headers: { 'user-agent': 'kayaking-conditions/0.1' },
+        signal: AbortSignal.timeout(15000)
+      });
+      if (!r.ok) {
+        const error = new Error(`${host}: HTTP ${r.status}`);
+        // Retry rate limiting and server-side/transient failures only.
+        if (r.status !== 429 && r.status < 500) throw error;
+        lastError = error;
+      } else {
+        return await r.json();
+      }
+    } catch (err) {
+      lastError = err;
+      // A non-retryable HTTP error thrown above should fail immediately.
+      if (
+        err instanceof Error &&
+        /^.+: HTTP 4\d\d$/.test(err.message) &&
+        !err.message.endsWith('HTTP 429')
+      ) {
+        throw err;
+      }
+    }
+    if (attempt < 2) {
+      await new Promise(resolve => setTimeout(resolve, 750));
+    }
+  }
+  const message =
+    lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(
+    `${host}: forecast fetch failed after 2 attempts: ${message}`
+  );
 }
 async function collect() {
   const checkedAt = stamp();
