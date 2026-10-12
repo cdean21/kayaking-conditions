@@ -1,0 +1,17 @@
+{
+  "name": "kayaking-conditions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "migrate": "wrangler d1 migrations apply kayaking-conditions --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "suncalc": "^2.0.2"
+  }
+}

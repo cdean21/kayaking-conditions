@@ -1,0 +1,11 @@
+{
+  "name": "kayaking-conditions",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "triggers": { "crons": ["0 * * * *"] },
+  "vars": { "TZ": "Australia/Melbourne", "ALERTS_ENABLED": "false" },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "kayaking-conditions", "database_id": "604a1cd4-099c-4166-beb6-7747a622efa4" }
+  ]
+}
