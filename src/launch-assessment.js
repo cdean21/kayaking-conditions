@@ -2,11 +2,52 @@
 const FORECAST_MAX_AGE_MS=3*3600000;
 const num=v=>typeof v==='number'&&Number.isFinite(v)?v:null;
 const offshoreSector=deg=>{if(num(deg)===null)return false;const d=((deg%360)+360)%360;return d>=45&&d<=135;};
-const PROFILES={
+export const PROFILES={
  fishing:{wind:{preferredMax:10,hardMax:15},gust:{preferredMax:15,hardMax:20},wave:{preferredMax:.4,hardMax:.8}},
  kayaking:{wind:{preferredMax:12,hardMax:18},gust:{preferredMax:16,hardMax:22},wave:{preferredMax:.4,hardMax:.8}},
  sailing:{wind:{preferredMin:8,preferredMax:20,hardMax:25},gust:{preferredMax:24,hardMax:30},wave:{preferredMax:.7,hardMax:1.0}}
 };
+export function activityPreferenceFit(activity, values = {}) {
+  const limits = PROFILES[activity] || PROFILES.fishing;
+
+  const wind = num(Number(values.wind));
+  const gust = num(Number(values.gust));
+  const wave = num(Number(values.wave));
+
+  let score = 0;
+  const reasons = [];
+
+  if (wind !== null) {
+    const inPreferred =
+      (limits.wind.preferredMin == null || wind >= limits.wind.preferredMin) &&
+      wind <= limits.wind.preferredMax;
+
+    if (inPreferred) {
+      score += 5;
+      reasons.push('wind in preferred range');
+    }
+
+    if (activity === 'sailing' && wind >= 10 && wind <= 16) {
+      score += 2;
+    }
+  }
+
+  if (wave !== null && wave <= limits.wave.preferredMax) {
+    score += 2;
+    reasons.push('waves in preferred range');
+  }
+
+  if (gust !== null && gust <= limits.gust.preferredMax) {
+    score += 1;
+    reasons.push('gusts in preferred range');
+  }
+
+  return {
+    score,
+    reasons,
+    thresholds: limits
+  };
+}
 export function assessLaunch({site='carrum-foreshore',activity='fishing',official,notices,point,forecastCheckedAt,at,tide}){
  const blockers=[],cautions=[],passed=[],missing=[],arrival_checks=[];const limits=PROFILES[activity]||PROFILES.fishing;
  if(!official||official.stale||['missing','invalid'].includes(official.status))missing.push('Fresh validated BOM marine status');

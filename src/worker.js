@@ -1,5 +1,5 @@
 import { readLocalNotices, validateNoticePayload } from './local-notices.js';
-import { assessLaunch } from './launch-assessment.js';
+import { assessLaunch, activityPreferenceFit } from './launch-assessment.js';
 import { buildOfficialMarineSnapshot, BOM_MARINE_WARNINGS, validateTideEvents } from './official-marine.js';
 import { buildBiteTimeline } from './bite-timeline.js';
 import { lunarDetails } from './lunar.js';
@@ -163,27 +163,18 @@ function opportunityScore(run,quality){
 
 function activityFitScore(o) {
   const d=o.details||{};
-  const wind=Number(d.mean_wind_kn);
-  const gust=Number(d.peak_gust_kn);
-  const wave=Number(d.max_wave_m);
-  let fit=0;
-
-  if(o.activity==='sailing'){
-    if(Number.isFinite(wind)&&wind>=8&&wind<=20) fit+=5;
-    if(Number.isFinite(wind)&&wind>=10&&wind<=16) fit+=2;
-    if(Number.isFinite(wave)&&wave<=0.7) fit+=2;
-    if(Number.isFinite(gust)&&gust<=24) fit+=1;
-  } else if(o.activity==='fishing'){
-    if(Number.isFinite(wind)&&wind<=10) fit+=5;
-    if(Number.isFinite(wave)&&wave<=0.4) fit+=3;
-    if(Number.isFinite(gust)&&gust<=15) fit+=1;
-  } else if(o.activity==='kayaking'){
-    if(Number.isFinite(wind)&&wind<=12) fit+=5;
-    if(Number.isFinite(wave)&&wave<=0.4) fit+=3;
-    if(Number.isFinite(gust)&&gust<=16) fit+=1;
-  }
-
-  return fit;
+  return activityPreferenceFit(o.activity,{wind:Number(d.mean_wind_kn),gust:Number(d.peak_gust_kn),wave:Number(d.max_wave_m)}).score;
+}
+function recommendationConfidence(o){
+  const d=o.details||{},hourly=d.hourly||[];
+  const preferred=hourly.filter(h=>h.assessment_status==='preferred').length,total=Math.max(1,hourly.length);
+  let score=55+Math.round(25*(preferred/total));
+  const bom=(d.bom_cross_check||[]).length,advisories=(d.advisories||[]).length;
+  score+=bom?-12:12; score-=Math.min(18,advisories*8);
+  const age=Date.now()-Date.parse(d.forecast_checked_at||'');
+  if(Number.isFinite(age)){if(age<=3600000)score+=8;else if(age>7200000)score-=8;}else score-=20;
+  score=Math.max(0,Math.min(100,score));
+  return {score,level:score>=80?'HIGH':score>=60?'MEDIUM':'LOW',basis:{preferred_hours:preferred,total_hours:hourly.length,bom_model_disagreement:bom>0,advisory_count:advisories}};
 }
 
 function recommendationRank(o) {
@@ -204,11 +195,13 @@ function recommendationRank(o) {
   );
 }
 
-function activityRecommendationReason(o) {
+function activityRecommendationReason(o, comparison=[]) {
   const d=o.details||{};
   const wind=Number(d.mean_wind_kn);
   const gust=Number(d.peak_gust_kn);
   const wave=Number(d.max_wave_m);
+  const winnerFit=activityPreferenceFit(o.activity,{wind,gust,wave});
+  const runner=[...comparison].filter(x=>x?.available&&x.activity!==o.activity).sort((a,b)=>(b.rank||0)-(a.rank||0))[0];
 
   const conditions=[
     Number.isFinite(wind)?`${wind.toFixed(1)} kt mean wind`:null,
@@ -216,15 +209,20 @@ function activityRecommendationReason(o) {
     Number.isFinite(wave)?`modelled waves to ${wave.toFixed(2)} m`:null
   ].filter(Boolean).join(', ');
 
-  if(o.activity==='sailing')
-    return `${conditions}. These conditions fit sailing better than fishing or paddling.`;
+  const preferred=(winnerFit.reasons||[]).map(x=>x.replace(' in preferred range','')).join(', ');
+  let why=preferred?`${activityLabel(o.activity)} matches the preferred ${preferred} bands.`:`${activityLabel(o.activity)} has the strongest overall fit for this window.`;
 
-  if(o.activity==='fishing')
-    return `${conditions}. The lighter wind and sea state favour fishing over the other activities.`;
+  if(runner){
+    const gap=Math.round((recommendationRank(o)-Number(runner.rank||0))*10)/10;
+    const closeness=gap<2500?'narrowly ':'';
+    why+=` It ${closeness}ranks ahead of ${activityLabel(runner.activity).toLowerCase()}`;
+    const runnerFit=Number(runner.fit_score);
+    if(Number.isFinite(runnerFit)) why+=` (${winnerFit.score} vs ${runnerFit} preference-fit points)`;
+    why+='.';
+  }
 
-  return `${conditions}. These conditions favour paddling over the other activities.`;
+  return `${conditions}. ${why}`;
 }
-
 function bestSpeciesForWindow(o,data,tides,official,noticesBySite) {
   if(o.activity!=='fishing') return null;
 
@@ -285,43 +283,15 @@ function bestSpeciesForWindow(o,data,tides,official,noticesBySite) {
 
 function annotateRecommendations(opportunities,data,official,noticesBySite,tides) {
   const groups=new Map();
-
-  for(const o of opportunities){
-    // One recommendation per available Melbourne-local day, across both
-    // launch sites and all activities. This prevents duplicate positive
-    // alerts for Carrum and Patterson for effectively the same outing.
-    const key=localDateKey(o.starts_at);
-    if(!groups.has(key)) groups.set(key,[]);
-    groups.get(key).push(o);
+  for(const o of opportunities){const key=localDateKey(o.starts_at);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(o);}
+  for(const [localDate,group] of groups){
+    const ranked=[...group].sort((a,b)=>recommendationRank(b)-recommendationRank(a)||Date.parse(a.starts_at)-Date.parse(b.starts_at));
+    const winner=ranked[0]; if(!winner)continue;
+    const species=bestSpeciesForWindow(winner,data,tides,official,noticesBySite),confidence=recommendationConfidence(winner);
+    const comparison=['fishing','kayaking','sailing'].map(activity=>{const pick=ranked.find(x=>x.activity===activity);if(!pick)return {activity,available:false};const fit=activityPreferenceFit(activity,{wind:Number(pick.details?.mean_wind_kn),gust:Number(pick.details?.peak_gust_kn),wave:Number(pick.details?.max_wave_m)});return {activity,available:true,site_id:pick.site_id,starts_at:pick.starts_at,ends_at:pick.ends_at,classification:pick.details?.classification,rank:recommendationRank(pick),fit_score:fit.score,fit_reasons:fit.reasons,mean_wind_kn:pick.details?.mean_wind_kn,peak_gust_kn:pick.details?.peak_gust_kn,max_wave_m:pick.details?.max_wave_m,is_winner:pick===winner};});
+    const reason=activityRecommendationReason(winner,comparison);
+    for(const o of group)o.details.recommendation={local_date:localDate,best_activity:winner.activity,best_activity_label:activityLabel(winner.activity),best_site_id:winner.site_id,best_starts_at:winner.starts_at,best_ends_at:winner.ends_at,is_best_activity:o===winner,is_best_outing:o===winner,reason,best_species:species,confidence,comparison};
   }
-
-  for(const group of groups.values()){
-    const winner=[...group].sort((a,b)=>
-      recommendationRank(b)-recommendationRank(a) ||
-      Date.parse(a.starts_at)-Date.parse(b.starts_at)
-    )[0];
-
-    if(!winner) continue;
-
-    const species=bestSpeciesForWindow(
-      winner,data,tides,official,noticesBySite
-    );
-
-    for(const o of group){
-      o.details.recommendation={
-        best_activity:winner.activity,
-        best_activity_label:activityLabel(winner.activity),
-        best_site_id:winner.site_id,
-        best_starts_at:winner.starts_at,
-        best_ends_at:winner.ends_at,
-        is_best_activity:o===winner,
-        is_best_outing:o===winner,
-        reason:activityRecommendationReason(winner),
-        best_species:species
-      };
-    }
-  }
-
   return opportunities;
 }
 
@@ -582,63 +552,52 @@ function formatAlert(eventType,payload){
   const activity=activityLabel(base.activity || payload.activity || previous?.activity);
   const window=localWindowLabel(base.starts_at,base.ends_at);
   const d=base.details || {};
-  const conditions=conditionSummary(d);
-  const tide=tideSummary(d);
-  const arrival=(d.arrival_checks||[])[0];
-  const caveat=(d.bom_cross_check||[])[0];
   const rec=d.recommendation||{};
   const species=rec.best_species||null;
-  let title,lead;
-  if(eventType==='NEW_OPPORTUNITY'){
-    if(rec.is_best_activity){
-      title=activity==='Fishing'&&species
-        ? `Hobie: fishing looks best — ${species.name}`
-        : `Hobie: ${activity.toLowerCase()} is the best fit`;
 
-      lead=`${activity} is the best forecast fit at ${site}: ${window}.`;
-
-      if(rec.reason) lead+=` ${rec.reason}`;
-
-      if(activity==='Fishing'&&species){
-        lead+=` Best target: ${species.name} — average suitability ${species.mean_score}/100, peak ${species.peak_score}/100 during this window.`;
-      }
-    } else {
-      title=`Hobie: new ${activity.toLowerCase()} window`;
-      lead=`New ${d.classification||'qualifying'} forecast opportunity at ${site}: ${window}.`;
-    }
-  } else if(eventType==='IMPROVED'){
-    if(rec.is_best_activity){
-      title=activity==='Fishing'&&species
-        ? `Hobie: fishing now looks best — ${species.name}`
-        : `Hobie: ${activity.toLowerCase()} now looks best`;
-
-      lead=`${activity} is now the best forecast fit at ${site}: ${window}.`;
-
-      if(rec.reason) lead+=` ${rec.reason}`;
-
-      if(activity==='Fishing'&&species){
-        lead+=` Best target: ${species.name} — average suitability ${species.mean_score}/100, peak ${species.peak_score}/100 during this window.`;
-      }
-    } else {
-      title=`Hobie: ${activity.toLowerCase()} window improved`;
-      lead=`Forecast opportunity at ${site} has improved: ${window}${d.classification?` (${d.classification})`:''}.`;
-    }
-  } else if(eventType==='DETERIORATING'){
-    title=`Hobie: ${activity.toLowerCase()} window deteriorating`;
-    const oldClass=previous?.details?.classification, newClass=d.classification;
-    const change=oldClass&&newClass&&oldClass!==newClass?` ${oldClass} → ${newClass}.`:'';
-    lead=`Forecast opportunity at ${site} has deteriorated: ${window}.${change}`;
-  } else {
-    title=`Hobie: ${activity.toLowerCase()} window cancelled`;
-    lead=`The previously identified forecast opportunity at ${site} (${window}) no longer has at least two consecutive usable hours.`;
+  // Pushover is a lock-screen decision summary. Detailed BOM/tide/advisory
+  // evidence remains on the dashboard.
+  if(eventType==='CANCELLED'){
+    return {
+      title:`${activity.toUpperCase()} · CANCELLED`,
+      message:`${site} · ${window}\nWindow no longer qualifies. Recheck dashboard before making plans.`,
+      priority:0
+    };
   }
-  const parts=[lead];
-  if(conditions) parts.push(`${conditions}.`);
-  if(tide) parts.push(tide);
-  if(caveat) parts.push(caveat);
-  if(arrival) parts.push(arrival);
-  parts.push('Forecast guidance only — recheck BOM warnings and actual launch conditions before departure.');
-  return {title,message:parts.join(' ').slice(0,1024),priority:0};
+
+  const quality=d.classification==='preferred'?'GOOD WINDOW':'MARGINAL WINDOW';
+  const wind=Number.isFinite(Number(d.mean_wind_kn))?Number(d.mean_wind_kn).toFixed(1):null;
+  const gust=Number.isFinite(Number(d.peak_gust_kn))?Number(d.peak_gust_kn).toFixed(1):null;
+  const wave=Number.isFinite(Number(d.max_wave_m))?Number(d.max_wave_m).toFixed(2):null;
+
+  const conditionBits=[];
+  if(wind!==null) conditionBits.push(`Wind ${wind}`);
+  if(gust!==null) conditionBits.push(`Gust ${gust} kt`);
+  if(wave!==null) conditionBits.push(`Waves ${wave} m`);
+
+  const cautionBits=[];
+  if((d.bom_cross_check||[]).length) cautionBits.push('BOM rougher');
+  if((d.advisories||[]).length) cautionBits.push('local advisory');
+
+  let change='';
+  if(eventType==='IMPROVED') change=' · IMPROVED';
+  else if(eventType==='DETERIORATING') change=' · DETERIORATING';
+
+  const title=`${activity.toUpperCase()} · ${window.toUpperCase()}${change}`;
+  const lines=[`${site} · ${quality}`];
+
+  if(activity==='Fishing'&&species){
+    lines.push(`Best target: ${species.name} · ${species.mean_score}/100`);
+  }
+  if(conditionBits.length) lines.push(conditionBits.join(' · '));
+
+  lines.push(
+    cautionBits.length
+      ? `${cautionBits.join(' · ')} · Recheck before launch`
+      : 'Recheck before launch'
+  );
+
+  return {title,message:lines.join('\n').slice(0,1024),priority:0};
 }
 async function positiveAlertGate(env,row,details){
   if(!isStableOpportunityKey(row.opportunity_key)) return {ok:false,permanent:true,reason:'unstable opportunity key'};
@@ -927,6 +886,41 @@ async function currentLaunchAssessment(env, site='carrum-foreshore', activity='f
   return assessLaunch({site,activity,official,notices,point,forecastCheckedAt:row?.checked_at,at,tide});
 }
 
+
+function recommendationWinners(opportunities){const out=new Map();for(const o of opportunities)if(o.details?.recommendation?.is_best_outing===true)out.set(localDateKey(o.starts_at),o);return out;}
+function recommendationSnapshot(o){const r=o.details?.recommendation||{};return {local_date:localDateKey(o.starts_at),site_id:o.site_id,activity:o.activity,starts_at:o.starts_at,ends_at:o.ends_at,classification:o.details?.classification||'marginal',score:o.score,mean_wind_kn:o.details?.mean_wind_kn,peak_gust_kn:o.details?.peak_gust_kn,max_wave_m:o.details?.max_wave_m,best_species:r.best_species||null,confidence:r.confidence||recommendationConfidence(o),comparison:r.comparison||[],reason:r.reason||null};}
+function recommendationEventType(prev,next){if(!prev)return 'NEW_RECOMMENDATION';if(prev.activity!==next.activity||prev.site_id!==next.site_id||(prev.best_species?.id||null)!==(next.best_species?.id||null))return 'RECOMMENDATION_CHANGED';if(prev.classification==='marginal'&&next.classification==='preferred')return 'RECOMMENDATION_IMPROVED';if(prev.classification==='preferred'&&next.classification==='marginal')return 'RECOMMENDATION_DETERIORATING';const od=hours(prev.starts_at,prev.ends_at),nd=hours(next.starts_at,next.ends_at),oc=Number(prev.confidence?.score)||0,nc=Number(next.confidence?.score)||0;if(nd>=od+2||nc>=oc+15)return 'RECOMMENDATION_IMPROVED';if(nd<=od-2||nc<=oc-15)return 'RECOMMENDATION_DETERIORATING';return null;}
+async function recommendationEventRow(env,date,type,current,previous){await env.DB.prepare(`INSERT INTO tbl_recommendation_events (local_date,event_type,created_at,details_json,delivery_status) VALUES (?,?,?,?, 'pending')`).bind(date,type,stamp(),JSON.stringify({current,previous})).run();}
+async function storeRecommendationState(env,opportunities){
+ const winners=recommendationWinners(opportunities),now=stamp(),count=await env.DB.prepare("SELECT COUNT(*) AS n FROM tbl_recommendations").first(),bootstrap=Number(count?.n||0)===0;
+ const active=await env.DB.prepare("SELECT * FROM tbl_recommendations WHERE status='active'").all(),prior=new Map((active.results||[]).map(r=>[r.local_date,r]));let events=0;
+ for(const [date,o] of winners){const next=recommendationSnapshot(o),row=prior.get(date);let prev=null;if(row){try{prev=JSON.parse(row.details_json||'{}')}catch{}}const type=bootstrap?null:recommendationEventType(prev,next);await env.DB.prepare(`INSERT INTO tbl_recommendations (local_date,site_id,activity,starts_at,ends_at,status,details_json,first_seen_at,last_seen_at) VALUES (?,?,?,?,?,'active',?,?,?) ON CONFLICT(local_date) DO UPDATE SET site_id=excluded.site_id,activity=excluded.activity,starts_at=excluded.starts_at,ends_at=excluded.ends_at,status='active',details_json=excluded.details_json,last_seen_at=excluded.last_seen_at`).bind(date,next.site_id,next.activity,next.starts_at,next.ends_at,JSON.stringify(next),row?.first_seen_at||now,now).run();if(type){await recommendationEventRow(env,date,type,next,prev);events++;}prior.delete(date);}
+ for(const [date,row] of prior){if(Date.parse(row.ends_at)<=Date.now())continue;let prev={};try{prev=JSON.parse(row.details_json||'{}')}catch{}await env.DB.prepare("UPDATE tbl_recommendations SET status='cancelled',last_seen_at=? WHERE local_date=?").bind(now,date).run();if(!bootstrap){await recommendationEventRow(env,date,'RECOMMENDATION_CANCELLED',null,prev);events++;}}
+ return {events,bootstrapped:bootstrap};
+}
+function formatRecommendationAlert(type,details){const x=details.current||details.previous||{},activity=activityLabel(x.activity).toUpperCase(),window=localWindowLabel(x.starts_at,x.ends_at);let suffix='';if(type==='RECOMMENDATION_CHANGED')suffix=' · CHANGED';else if(type==='RECOMMENDATION_IMPROVED')suffix=' · IMPROVED';else if(type==='RECOMMENDATION_DETERIORATING')suffix=' · DETERIORATING';else if(type==='RECOMMENDATION_CANCELLED')suffix=' · CANCELLED';if(type==='RECOMMENDATION_CANCELLED')return {title:`${activity}${suffix}`,message:`${siteLabel(x.site_id)} · ${window}\nWindow no longer qualifies. Recheck dashboard before making plans.`,priority:0};const quality=x.classification==='preferred'?'GOOD WINDOW':'MARGINAL WINDOW',lines=[`${siteLabel(x.site_id)} · ${quality}`];if(x.activity==='fishing'&&x.best_species)lines.push(`Best target: ${x.best_species.name} · ${x.best_species.mean_score}/100`);const bits=[];if(Number.isFinite(Number(x.mean_wind_kn)))bits.push(`Wind ${Number(x.mean_wind_kn).toFixed(1)}`);if(Number.isFinite(Number(x.peak_gust_kn)))bits.push(`Gust ${Number(x.peak_gust_kn).toFixed(1)} kt`);if(Number.isFinite(Number(x.max_wave_m)))bits.push(`Waves ${Number(x.max_wave_m).toFixed(2)} m`);if(bits.length)lines.push(bits.join(' · '));lines.push(`${x.confidence?.level||'UNKNOWN'} confidence · Recheck before launch`);return {title:`${activity} · ${window.toUpperCase()}${suffix}`,message:lines.join('\n'),priority:0};}
+function recommendationTransitionTest(type,base){
+  const current={...base,confidence:{...(base.confidence||{})}};
+  const previous={...base,confidence:{...(base.confidence||{})}};
+  if(type==='RECOMMENDATION_CHANGED'){
+    previous.activity=current.activity==='sailing'?'kayaking':'sailing';
+    previous.best_species=null;
+  }else if(type==='RECOMMENDATION_IMPROVED'){
+    previous.classification='marginal';
+    current.classification='preferred';
+    previous.confidence={...(previous.confidence||{}),score:Math.max(0,(Number(current.confidence?.score)||75)-20),level:'LOW'};
+  }else if(type==='RECOMMENDATION_DETERIORATING'){
+    previous.classification='preferred';
+    current.classification='marginal';
+    current.confidence={...(current.confidence||{}),score:Math.min(Number(current.confidence?.score)||55,55),level:'LOW'};
+  }else if(type==='RECOMMENDATION_CANCELLED'){
+    return {current:null,previous};
+  }
+  return {current,previous};
+}
+async function recommendationPositiveGate(env,row,details){const x=details.current;if(!x)return {ok:false,permanent:true,reason:'missing current recommendation'};const state=await env.DB.prepare("SELECT status,details_json FROM tbl_recommendations WHERE local_date=?").bind(row.local_date).first();if(!state||state.status!=='active')return {ok:false,permanent:true,reason:'recommendation is no longer active'};let latest={};try{latest=JSON.parse(state.details_json||'{}')}catch{}if(latest.activity!==x.activity||latest.site_id!==x.site_id||latest.starts_at!==x.starts_at)return {ok:false,permanent:true,reason:'recommendation has been superseded'};const official=await readOfficialMarineSnapshot(env);if(official.stale||official.status!=='verified_no_port_phillip_warning'||official.warning?.port_phillip_warning_active||official.positive_alert_gate!=='warning_check_passed')return {ok:false,permanent:false,reason:'official BOM positive-alert gate is blocked'};const assessment=await currentLaunchAssessment(env,x.site_id,x.activity,x.starts_at);if(!assessment||!['preferred','marginal'].includes(assessment.status)||(assessment.blockers||[]).length)return {ok:false,permanent:false,reason:'current launch assessment is blocked or incomplete'};return {ok:true};}
+async function deliverRecommendationAlerts(env){if(env.ALERTS_ENABLED!=='true')return {sent:0,note:'Alerts disabled'};const rows=await env.DB.prepare(`SELECT id,local_date,event_type,created_at,details_json FROM tbl_recommendation_events WHERE delivery_status='pending' ORDER BY id ASC LIMIT 30`).all(),newestRows=await env.DB.prepare(`SELECT local_date,MAX(id) newest_id FROM tbl_recommendation_events WHERE delivery_status='pending' GROUP BY local_date`).all(),newest=new Map((newestRows.results||[]).map(r=>[r.local_date,Number(r.newest_id)]));let sent=0,deferred=0,suppressed=0,failed=0;for(const row of rows.results||[]){if(newest.get(row.local_date)!==Number(row.id)){await env.DB.prepare("UPDATE tbl_recommendation_events SET delivery_status='suppressed_superseded',delivery_error=? WHERE id=? AND delivery_status='pending'").bind('newer recommendation event exists',row.id).run();suppressed++;continue;}let details={};try{details=JSON.parse(row.details_json||'{}')}catch{}const positive=['NEW_RECOMMENDATION','RECOMMENDATION_CHANGED','RECOMMENDATION_IMPROVED'].includes(row.event_type);if(positive){const gate=await recommendationPositiveGate(env,row,details);if(!gate.ok){if(gate.permanent){await env.DB.prepare("UPDATE tbl_recommendation_events SET delivery_status='suppressed',delivery_error=? WHERE id=? AND delivery_status='pending'").bind(gate.reason,row.id).run();suppressed++;}else deferred++;continue;}}const claim=await env.DB.prepare("UPDATE tbl_recommendation_events SET delivery_status='sending',delivery_claimed_at=? WHERE id=? AND delivery_status='pending'").bind(stamp(),row.id).run();if(Number(claim?.meta?.changes||0)!==1)continue;const msg=formatRecommendationAlert(row.event_type,details),base=env.DASHBOARD_URL||'https://kayaking-conditions.delicate-meadow-3eb1.workers.dev/dashboard';msg.url=`${base}?date=${encodeURIComponent(row.local_date)}`;try{const result=await sendPushover(env,msg);await env.DB.prepare("UPDATE tbl_recommendation_events SET delivery_status='sent',delivery_request_id=?,delivered_at=? WHERE id=?").bind(result.request||null,stamp(),row.id).run();sent++;}catch(e){await env.DB.prepare("UPDATE tbl_recommendation_events SET delivery_status='delivery_unknown',delivery_error=? WHERE id=?").bind(String(e),row.id).run();failed++;}}return {sent,deferred,suppressed,failed};}
+
 async function run(env) {
   try {
     const official = await readOfficialMarineSnapshot(env);
@@ -943,8 +937,9 @@ async function run(env) {
       'patterson-river':pattersonNotices
     },tides,data.checkedAt);
     const changes = await store(env,data,opportunities);
-    const delivery = await deliverPendingAlerts(env);
-    return { checked_at:stamp(), candidates:opportunities.length, change_events:changes, delivery, official_marine:official, safety_verified:false, note:'Forecast run reads the latest validated BOM snapshot from D1 and never waits on FTP. Missing or stale BOM data blocks positive alerts. Patterson River entrance/live launch conditions remain a separate safety gate.' };
+    const recommendation = await storeRecommendationState(env,opportunities);
+    const delivery = await deliverRecommendationAlerts(env);
+    return { checked_at:stamp(), candidates:opportunities.length, change_events:changes, recommendation_events:recommendation.events, recommendation_bootstrapped:recommendation.bootstrapped, delivery, official_marine:official, safety_verified:false, note:'Pushover is driven by date-level recommendation state. Underlying opportunity events remain stored for environmental history. Missing or stale BOM data blocks positive alerts; launch conditions still require on-arrival verification.' };
   } catch (e) {
     await env.DB.prepare('INSERT INTO tbl_forecast_runs (checked_at,status,error) VALUES (?,?,?)').bind(stamp(),'error',String(e)).run();
     throw e;
@@ -984,6 +979,10 @@ export default {
           event_matching:'stable by site + activity + Melbourne local date; >=2h/10pt hysteresis',
           windows
         });
+      }
+      if (u.pathname === '/api/recommendations' && request.method === 'GET') {
+        const rows=await env.DB.prepare("SELECT local_date,site_id,activity,starts_at,ends_at,status,details_json,last_seen_at FROM tbl_recommendations WHERE status='active' AND ends_at > ? ORDER BY starts_at ASC LIMIT 14").bind(stamp()).all();
+        return json({recommendations:(rows.results||[]).map(r=>{let details={};try{details=JSON.parse(r.details_json||'{}')}catch{}return {...r,details,details_json:undefined};}),safety_verified:false});
       }
       if (u.pathname === '/api/opportunities') {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
@@ -1067,12 +1066,124 @@ export default {
       }
       if (u.pathname === '/api/pushover/test' && request.method === 'POST') {
         if (!await auth(request,env)) return json({ error:'Unauthorized' },401);
-        const delivery = await sendPushover(env, {
-          title: 'Kayaking Conditions Watch — Test',
-          message: 'Your Carrum Hobie lock-screen notifications are connected. This is a test, not a marine forecast.',
-          priority: 0
+
+        let body={};
+        try { body=await request.json(); } catch {}
+        const mode=body?.mode||'connection';
+
+        // Preserve the existing dashboard connection test.
+        if(mode==='connection'){
+          const delivery=await sendPushover(env,{
+            title:'Kayaking Conditions Watch — Test',
+            message:'Your Carrum Hobie lock-screen notifications are connected. This is a test, not a marine forecast.',
+            priority:0
+          });
+          return json({ok:true,mode,delivery});
+        }
+
+        const transitionModes={
+          'transition-changed':'RECOMMENDATION_CHANGED',
+          'transition-improved':'RECOMMENDATION_IMPROVED',
+          'transition-deteriorating':'RECOMMENDATION_DETERIORATING',
+          'transition-cancelled':'RECOMMENDATION_CANCELLED'
+        };
+        if(!['current-best','best-fishing',...Object.keys(transitionModes)].includes(mode)){
+          return json({error:'Unknown test mode. Use connection, current-best, best-fishing, transition-changed, transition-improved, transition-deteriorating, or transition-cancelled.'},400);
+        }
+
+        // Build a fresh recommendation preview from the latest stored numerical
+        // forecast plus current BOM/local-notice/tide state. This does NOT call
+        // store(), eventRow(), deliverPendingAlerts(), or mutate dedupe state.
+        const official=await readOfficialMarineSnapshot(env);
+        const tideStart=new Date(Date.now()-12*3600000).toISOString();
+        const tideEnd=new Date(Date.now()+84*3600000).toISOString();
+        const [carrumNotices,pattersonNotices,row,tides]=await Promise.all([
+          readLocalNotices(env,'carrum-foreshore'),
+          readLocalNotices(env,'patterson-river'),
+          env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first(),
+          readVerifiedTides(env,tideStart,tideEnd)
+        ]);
+        if(!row) return json({error:'No stored forecast available for test'},404);
+
+        const data={
+          weather:JSON.parse(row.weather_json),
+          marine:JSON.parse(row.marine_json),
+          checkedAt:row.checked_at
+        };
+        const noticesBySite={
+          'carrum-foreshore':carrumNotices,
+          'patterson-river':pattersonNotices
+        };
+        const windows=buildOpportunities(data,official,noticesBySite,tides,row.checked_at);
+        if(!windows.length) return json({error:'No current qualifying windows available for test'},409);
+
+        let candidate;
+        if(mode==='current-best'||transitionModes[mode]){
+          candidate=windows
+            .filter(o=>o.details?.recommendation?.is_best_activity===true)
+            .sort((a,b)=>Date.parse(a.starts_at)-Date.parse(b.starts_at))[0];
+        } else {
+          candidate=windows
+            .filter(o=>o.activity==='fishing')
+            .sort((a,b)=>
+              recommendationRank(b)-recommendationRank(a) ||
+              Date.parse(a.starts_at)-Date.parse(b.starts_at)
+            )[0];
+
+          if(candidate){
+            const species=bestSpeciesForWindow(candidate,data,tides,official,noticesBySite);
+            candidate={
+              ...candidate,
+              details:{
+                ...candidate.details,
+                recommendation:{
+                  ...(candidate.details?.recommendation||{}),
+                  best_activity:'fishing',
+                  best_activity_label:'Fishing',
+                  best_site_id:candidate.site_id,
+                  best_starts_at:candidate.starts_at,
+                  best_ends_at:candidate.ends_at,
+                  is_best_activity:true,
+                  is_best_outing:true,
+                  reason:activityRecommendationReason(candidate,candidate.details?.recommendation?.comparison||[]),
+                  best_species:species
+                }
+              }
+            };
+          }
+        }
+
+        if(!candidate) return json({error:`No ${mode} candidate available for test`},409);
+
+        const snapshot=recommendationSnapshot(candidate);
+        const eventType=transitionModes[mode]||'NEW_RECOMMENDATION';
+        const transition=transitionModes[mode]
+          ? recommendationTransitionTest(eventType,snapshot)
+          : {current:snapshot,previous:null};
+        const formatted=formatRecommendationAlert(eventType,transition);
+        const base=env.DASHBOARD_URL||'https://kayaking-conditions.delicate-meadow-3eb1.workers.dev/dashboard';
+        const testMessage={
+          ...formatted,
+          title:`TEST — ${formatted.title}`,
+          message:`TEST ONLY — ${formatted.message}`,
+          url:`${base}?date=${encodeURIComponent(localDateKey(candidate.starts_at))}`
+        };
+        const delivery=await sendPushover(env,testMessage);
+
+        return json({
+          ok:true,
+          mode,
+          mutated_event_state:false,
+          candidate:{
+            site_id:candidate.site_id,
+            activity:candidate.activity,
+            starts_at:candidate.starts_at,
+            ends_at:candidate.ends_at,
+            recommendation:candidate.details?.recommendation||null
+          },
+          formatted:testMessage,
+          delivery
         });
-        return json({ ok:true, delivery });
       }
       if (u.pathname === '/api/bom/ingest' && request.method === 'POST') {
         const expected = env.BOM_INGEST_TOKEN;
