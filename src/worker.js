@@ -22,6 +22,10 @@ const json = (value, status = 200) => new Response(JSON.stringify(value, null, 2
 });
 const stamp = () => new Date().toISOString();
 const hours = (a, b) => (new Date(b) - new Date(a)) / 3600000;
+const RETURN_BUFFER_MINUTES = 30;
+const FORECAST_MAX_AGE_MS = 3 * 60 * 60 * 1000;
+const STABLE_OPPORTUNITY_KEY_RE = /^[^:]+:[^:]+:\d{4}-\d{2}-\d{2}$/;
+const isStableOpportunityKey = key => STABLE_OPPORTUNITY_KEY_RE.test(String(key || ''));
 const fmt = (date, opts) => new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Melbourne', ...opts }).format(new Date(date));
 const localParts = date => {
   const d = new Date(date);
@@ -44,6 +48,7 @@ async function fetchJson(url) {
   return r.json();
 }
 async function collect() {
+  const checkedAt = stamp();
   // Fetch each site separately so wind forecasts aren't mistakenly treated as identical.
   const weather = await Promise.all(SITES.map(async site => ({
     site: site.id,
@@ -58,7 +63,7 @@ async function collect() {
     latitude: MARINE_SAMPLE.lat, longitude: MARINE_SAMPLE.lon, timezone: 'UTC', forecast_days: 4,
     hourly: 'wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,' + MARINE_FIELDS.join(',')
   }));
-  return { weather, marine };
+  return { weather, marine, checkedAt };
 }
 function points(data) {
   const wave = new Map((data.marine.hourly?.time || []).map((t, i) => [t, {
@@ -101,8 +106,11 @@ function opportunityScore(run,quality){
   const base=quality==='preferred'?92:76;
   return Math.max(0,Math.min(100,Math.round(base-peak('gust')*.35-peak('wave_m')*8)));
 }
-function buildOpportunities(data, official, noticesBySite) {
+function buildOpportunities(data, official, noticesBySite, forecastCheckedAt=data?.checkedAt) {
   const result=[], now=Date.now();
+  const forecastCheckedMs=Date.parse(forecastCheckedAt || '');
+  const forecastAgeMs=Number.isFinite(forecastCheckedMs) ? now-forecastCheckedMs : Infinity;
+  if(forecastAgeMs > FORECAST_MAX_AGE_MS) return result;
   for(const site of SITES) for(const activity of ACTIVITIES){
     const ps=points(data).filter(p=>p.site===site.id&&Date.parse(p.time)>=now&&Date.parse(p.time)<=now+72*3600000).sort((a,b)=>a.time.localeCompare(b.time));
     let run=[];
@@ -127,13 +135,15 @@ function buildOpportunities(data, official, noticesBySite) {
       const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:bestDeparture,advisories,
         mean_wind_kn:avg('wind'),peak_gust_kn:peak('gust'),max_wave_m:peak('wave_m'),mean_wave_period_s:avg('wave_period_s'),
         wind_direction_deg:avg('direction'),hourly:run.map(x=>({time:x.point.time,status:environmentalStatus(x.assessment),assessment_status:x.assessment.status,cautions:x.assessment.cautions,blockers:x.assessment.blockers})),
-        arrival_checks:run[0].assessment.arrival_checks||[],launch_verified:false,official_checks_included:true};
+        arrival_checks:run[0].assessment.arrival_checks||[],return_buffer_minutes:RETURN_BUFFER_MINUTES,feasible_return_rule:'Window must end at least 30 minutes before forecast sunset',forecast_checked_at:forecastCheckedAt,launch_verified:false,official_checks_included:true};
       result.push({key:`${site.id}:${activity.id}:${start.slice(0,13)}`,site_id:site.id,activity:activity.id,starts_at:start,ends_at:end,score:opportunityScore(run,quality),details});
       run=[];
     };
     for(const p of ps){
-      if(!eligible(p.time)||!p.is_day||!daylight(p.time,p.sunrise,p.sunset)){flush();continue;}
-      const assessment=assessLaunch({site:site.id,activity:activity.id,official,notices:noticesBySite[site.id],point:p,forecastCheckedAt:stamp(),at:p.time});
+      const hourEnd=Date.parse(p.time)+3600000;
+      const returnDeadline=Date.parse(p.sunset)-RETURN_BUFFER_MINUTES*60000;
+      if(!eligible(p.time)||!p.is_day||!daylight(p.time,p.sunrise,p.sunset)||!Number.isFinite(returnDeadline)||hourEnd>returnDeadline){flush();continue;}
+      const assessment=assessLaunch({site:site.id,activity:activity.id,official,notices:noticesBySite[site.id],point:p,forecastCheckedAt,at:p.time});
       if(['preferred','marginal'].includes(assessment.status)){
         if(run.length&&hours(run.at(-1).point.time,p.time)!==1)flush();
         run.push({point:p,assessment});
@@ -177,8 +187,9 @@ function classifyChange(prior,o){
 }
 async function store(env,data,opportunities){
   const now=stamp();
+  const forecastCheckedAt=data?.checkedAt || now;
   await env.DB.prepare('INSERT INTO tbl_forecast_runs (checked_at,status,weather_json,marine_json) VALUES (?,?,?,?)')
-    .bind(now,'ok',JSON.stringify(data.weather),JSON.stringify(data.marine)).run();
+    .bind(forecastCheckedAt,'ok',JSON.stringify(data.weather),JSON.stringify(data.marine)).run();
   const active=await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ?").bind(now).all();
   const rows=active.results||[], used=new Set(), surviving=new Set();
   let changes=0;
@@ -206,8 +217,10 @@ async function store(env,data,opportunities){
     if(used.has(prior.opportunity_key)||surviving.has(prior.opportunity_key))continue;
     // A still-future previously qualifying window has disappeared entirely: cancellation, not mere deterioration.
     await env.DB.prepare("UPDATE tbl_opportunities SET status='cancelled',last_seen_at=? WHERE opportunity_key=?").bind(now,prior.opportunity_key).run();
-    await eventRow(env,prior.opportunity_key,'CANCELLED',{previous:{key:prior.opportunity_key,site_id:prior.site_id,activity:prior.activity,starts_at:prior.starts_at,ends_at:prior.ends_at,score:prior.score,details:parseDetails(prior)},note:'Previously qualifying window no longer has at least two consecutive usable hours.'});
-    changes++;
+    if(isStableOpportunityKey(prior.opportunity_key)){
+      await eventRow(env,prior.opportunity_key,'CANCELLED',{previous:{key:prior.opportunity_key,site_id:prior.site_id,activity:prior.activity,starts_at:prior.starts_at,ends_at:prior.ends_at,score:prior.score,details:parseDetails(prior)},note:'Previously qualifying window no longer has at least two consecutive usable hours.'});
+      changes++;
+    }
   }
   return changes;
 }
@@ -315,7 +328,7 @@ async function run(env) {
     const opportunities = buildOpportunities(data,official,{
       'carrum-foreshore':carrumNotices,
       'patterson-river':pattersonNotices
-    });
+    },data.checkedAt);
     const changes = await store(env,data,opportunities);
     const delivery = await deliverPendingAlerts(env);
     return { checked_at:stamp(), candidates:opportunities.length, change_events:changes, delivery, official_marine:official, safety_verified:false, note:'Forecast run reads the latest validated BOM snapshot from D1 and never waits on FTP. Missing or stale BOM data blocks positive alerts. Patterson River entrance/live launch conditions remain a separate safety gate.' };
@@ -342,9 +355,10 @@ export default {
           env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first()
         ]);
         if(!row) return json({error:'No stored forecast'},404);
-        const data={weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json)};
-        const windows=buildOpportunities(data,official,{'carrum-foreshore':carrumNotices,'patterson-river':pattersonNotices});
-        return json({checked_at:row.checked_at,horizon_hours:72,min_window_hours:2,availability:'Weekends daylight; Wed/Fri after 16:00; Mon/Tue/Thu after 17:00 Melbourne time',alerts_enabled:env.ALERTS_ENABLED==='true',event_matching:'stable by site + activity + Melbourne local date; >=2h/10pt hysteresis',windows});
+        const data={weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json),checkedAt:row.checked_at};
+        const windows=buildOpportunities(data,official,{'carrum-foreshore':carrumNotices,'patterson-river':pattersonNotices},row.checked_at);
+        const forecastAgeMinutes=Math.max(0,Math.round((Date.now()-Date.parse(row.checked_at))/60000));
+        return json({checked_at:row.checked_at,forecast_age_minutes:Number.isFinite(forecastAgeMinutes)?forecastAgeMinutes:null,forecast_stale:!Number.isFinite(Date.parse(row.checked_at))||Date.now()-Date.parse(row.checked_at)>FORECAST_MAX_AGE_MS,horizon_hours:72,min_window_hours:2,return_buffer_minutes:RETURN_BUFFER_MINUTES,availability:'Weekends daylight; Wed/Fri after 16:00; Mon/Tue/Thu after 17:00 Melbourne time',alerts_enabled:env.ALERTS_ENABLED==='true',event_matching:'stable by site + activity + Melbourne local date; >=2h/10pt hysteresis',windows});
       }
       if (u.pathname === '/api/opportunities') {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
