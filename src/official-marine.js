@@ -24,14 +24,15 @@ function assertBomProduct(xml, expectedId) {
 export function parseWarningProduct(xml, now = new Date()) {
   const meta = assertBomProduct(xml, 'IDV20600');
   const hazards = [...xml.matchAll(/<hazard\b([^>]*)>([\s\S]*?)<\/hazard>/gi)].map(([,attrs,body]) => {
-    const areas = [...body.matchAll(/<area\b([^>]*)\/?\s*>/gi)].map(([,a]) => ({aac:attr(a,'aac'),description:attr(a,'description'),type:attr(a,'type')}));
+    const areas = [...body.matchAll(/<area\b([^>]*)\/?\s*>/gi)].map(([,a]) => ({aac:attr(a,'aac'),description:attr(a,'description'),type:attr(a,'type')})).filter(a=>a.aac);
     return {type:attr(attrs,'type'),severity:attr(attrs,'severity'),phase:attr(attrs,'phase'),phenomena:textByType(body,'warning_phenomena'),warning_areas:textByType(body,'warning_areas'),areas};
   });
-  const relevant = hazards.filter(h => h.areas.some(a => a.aac === BOM_PORT_PHILLIP_AAC));
+  const uniqueHazards = [...new Map(hazards.map(h => [JSON.stringify([h.type,h.severity,h.phase,h.phenomena,h.warning_areas,h.areas]),h])).values()];
+  const relevant = uniqueHazards.filter(h => h.areas.some(a => a.aac === BOM_PORT_PHILLIP_AAC));
   const stale = now.getTime() > Date.parse(meta.expiry_at);
   return {
     source:'Bureau of Meteorology anonymous FTP — Victorian Marine Wind Warning Summary', product_id:'IDV20600', product_file:BOM_WARNING_PRODUCT,
-    ...meta, stale, hazard_count:hazards.length, relevant_hazards:relevant, statewide_hazards:hazards,
+    ...meta, stale, hazard_count:uniqueHazards.length, relevant_hazards:relevant, statewide_hazards:uniqueHazards,
     port_phillip_warning_active: relevant.length > 0,
     warning_gate: stale ? 'blocked_stale' : relevant.length ? 'blocked_active_warning' : 'pass_no_port_phillip_warning',
     full_warnings_url:BOM_MARINE_WARNINGS

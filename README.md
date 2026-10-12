@@ -136,3 +136,70 @@ npx wrangler secret put BOM_INGEST_TOKEN
 ```
 
 Then in the GitHub repository add an Actions repository secret named `BOM_INGEST_TOKEN` with that same value. Do not commit the token. After deployment, run the `BOM marine ingest` workflow manually once to populate D1; scheduled runs then occur at minutes 07 and 37 each hour.
+
+## Official BOM Williamstown tides (reviewed import)
+
+BOM publishes annual 2026/2027 Melbourne (Williamstown) tide PDFs at
+https://www.bom.gov.au/oceanography/projects/ntc/vic_tide_tables.shtml .
+**This release does not automatically parse PDF tables or claim that tide data has been imported.**
+For accuracy, transcribe/check the official PDF into a CSV with headers:
+`local_date,local_time,event_type,height_m,source_year`.
+Use BOM's printed local time (AEDT/AEST as applicable), heights in metres above LAT,
+`high`/`low`, and the correct year. No example rows are provided because sample numbers
+could be mistaken for real predictions.
+
+Run `python3 tools/import_verified_tides.py path/to/reviewed.csv` to validate and preview.
+Then set ADMIN_TOKEN securely in your shell and run
+`python3 tools/import_verified_tides.py path/to/reviewed.csv --send`.
+The script imports batches of 100 through the existing authenticated endpoint;
+no D1 migration is required. It rejects duplicate timestamps, unexpected tide ordering,
+large gaps and ambiguous/nonexistent Melbourne DST times. The Worker also validates
+station, provenance, year and timestamp. Verify imported values against the original PDF.
+
+The graph now indicates reference-station **rising/falling** between adjacent verified
+high/low extrema and displays verified tide height when available. This is not a
+measurement or prediction of Patterson River entrance currents or water levels.
+BOM tide data is copyright Commonwealth of Australia, Bureau of Meteorology.
+This product is based on Bureau of Meteorology information that has subsequently been
+modified. The Bureau does not necessarily support or endorse, or have any connection
+with, this product. BOM makes no warranty as to availability, accuracy, currency,
+completeness, quality, reliability or fitness for purpose and excludes liability for
+loss or damage arising from reliance on the information, to the maximum extent permitted by law.
+Official source and full terms: https://www.bom.gov.au/oceanography/projects/ntc/vic_tide_tables.shtml
+
+## Official Williamstown tide PDF extraction (2026)
+
+Official source: https://www.bom.gov.au/ntc/IDO59001/IDO59001_2026_VIC_TP003.pdf
+
+The source is an annual PDF, **not a live tide feed**. Its predictions are for
+Melbourne (Williamstown), not the Patterson River entrance. They are not live
+water-level or current observations. Predictions use local Melbourne time,
+including daylight saving, and heights are metres above LAT.
+
+1. Download the official PDF from the source URL to the project directory as `williamstown_2026.pdf`.
+2. Install PDF extraction dependency: `python3 -m pip install pdfplumber`.
+3. Run `python3 tools/extract_bom_williamstown.py williamstown_2026.pdf --out williamstown_2026_REVIEW.csv`.
+4. **Do not import on extraction failure.** The PDF layout parser is provided for
+   local verification and has not been end-to-end tested against the actual PDF
+   in this build environment. If it fails, inspect the PDF/CSV and adjust the
+   parser, rather than fabricating missing predictions.
+5. Compare at least several dates per month (especially daylight-saving
+   transition dates) against the official PDF. Run
+   `python3 tools/import_verified_tides.py williamstown_2026_REVIEW.csv`
+   for validation (dry run).
+6. Once the PDF values are verified, run
+   `read -s ADMIN_TOKEN; export ADMIN_TOKEN` then
+   `python3 tools/import_verified_tides.py williamstown_2026_REVIEW.csv --send`.
+   Clear the shell variable afterward: `unset ADMIN_TOKEN`.
+7. Test `/api/fishing/tides` and the hourly graph tooltips. Do not treat tide
+   predictions as launch clearance. Keep alerts disabled.
+
+**BOM attribution and conditions:** Copyright Commonwealth of Australia,
+Bureau of Meteorology. This product is based on Bureau of Meteorology
+information that has subsequently been modified. The Bureau does not
+necessarily support or endorse, or have any connection with, this product.
+The Bureau makes no warranty regarding availability, accuracy, currency,
+completeness, quality or reliability, and excludes liability for loss arising
+from use of or reliance on the information, to the extent permitted by law.
+See the complete official conditions of use at
+https://www.bom.gov.au/oceanography/projects/ntc/vic_tide_tables.shtml .

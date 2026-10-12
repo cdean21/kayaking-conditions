@@ -1,3 +1,4 @@
+import { readLocalNotices, validateNoticePayload } from './local-notices.js';
 import { buildOfficialMarineSnapshot, BOM_MARINE_WARNINGS, validateTideEvents } from './official-marine.js';
 import { buildBiteTimeline } from './bite-timeline.js';
 import { lunarDetails } from './lunar.js';
@@ -254,6 +255,18 @@ export default {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
         return json({ safety_verified:false, opportunities:rows.results.map(x=>({ ...x, details:JSON.parse(x.details_json), details_json:undefined })) });
       }
+      if (u.pathname === '/api/local/notices' && request.method === 'GET') {
+        const site=u.searchParams.get('site')||'patterson-river';
+        if (!SITES.some(s=>s.id===site)) return json({error:'Unknown site'},400);
+        return json(await readLocalNotices(env,site));
+      }
+      if (u.pathname === '/api/local/notices/ingest' && request.method === 'POST') {
+        const expected=env.BOM_INGEST_TOKEN;
+        if(!expected || request.headers.get('authorization')!==`Bearer ${expected}`) return json({error:'Unauthorized'},401);
+        const payload=validateNoticePayload(await request.json());
+        await env.DB.prepare('INSERT INTO tbl_local_notice_snapshots (fetched_at,payload_json) VALUES (?,?)').bind(payload.fetched_at,JSON.stringify(payload)).run();
+        return json({ok:true,ingested:payload.notices.length,launch_verified:false});
+      }
       if (u.pathname === '/api/official/marine') {
         const check=await readOfficialMarineSnapshot(env);
         return json({ check, safety_verified:false });
@@ -266,7 +279,7 @@ export default {
         return json({ at:requested, moon:lunarDetails(requested) });
       }
       if (u.pathname === '/api/fishing/tides' && request.method === 'GET') {
-        const rows=await env.DB.prepare('SELECT reference_station,event_at,event_type,height_m,datum,source_name,source_url FROM tbl_verified_tides WHERE event_at >= ? ORDER BY event_at LIMIT 40').bind(new Date(Date.now()-86400000).toISOString()).all();
+        const rows=await env.DB.prepare("SELECT reference_station,event_at,event_type,height_m,datum,source_name,source_url FROM tbl_verified_tides WHERE datetime(event_at) >= datetime(?) ORDER BY datetime(event_at) LIMIT 40").bind(new Date(Date.now()-86400000).toISOString()).all();
         return json({events:rows.results,source:'manually entered, source-verified predictions only',local_entrance_verified:false});
       }
       if (u.pathname === '/api/fishing/tides' && request.method === 'POST') {
@@ -285,7 +298,9 @@ export default {
         if (!SITES.some(s=>s.id===site)) return json({error:'Unknown site'},400);
         const row=await env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first();
         if(!row) return json({site,status:'missing_forecast',hours:[],message:'Run forecast collection first'});
-        const tides=await env.DB.prepare('SELECT reference_station,event_at,event_type,height_m,datum,source_name FROM tbl_verified_tides WHERE event_at >= ? ORDER BY event_at LIMIT 100').bind(new Date(Date.now()-86400000).toISOString()).all();
+        const tideStart=new Date(Date.now()-12*3600000).toISOString();
+        const tideEnd=new Date(Date.now()+84*3600000).toISOString();
+        const tides=await env.DB.prepare("SELECT reference_station,event_at,event_type,height_m,datum,source_name FROM tbl_verified_tides WHERE datetime(event_at) >= datetime(?) AND datetime(event_at) <= datetime(?) ORDER BY datetime(event_at) LIMIT 100").bind(tideStart,tideEnd).all();
         return json(buildBiteTimeline({weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json),checkedAt:row.checked_at,tides:tides.results,site}));
       }
       if (u.pathname === '/api/fishing/outlook') {

@@ -7,9 +7,23 @@ const number = n => typeof n==='number' && Number.isFinite(n) ? n : null;
 function normalizeTime(t) { return asIso(/(?:Z|[+-]\d\d:\d\d)$/.test(t) ? t : t+'Z'); }
 function findTide(time, tides) {
   const ts=Date.parse(time);
-  const closest=[...tides].filter(t=>asIso(t.event_at)).sort((a,b)=>Math.abs(Date.parse(a.event_at)-ts)-Math.abs(Date.parse(b.event_at)-ts))[0];
-  if (!closest || Math.abs(Date.parse(closest.event_at)-ts)>6*3600000) return null;
-  return { type:closest.event_type, at:closest.event_at, hours_from_event:+((ts-Date.parse(closest.event_at))/3600000).toFixed(1), station:closest.reference_station, source:closest.source_name, datum:closest.datum, verified_reference:true, local_entrance_prediction:false };
+  const sorted=tides.filter(t=>asIso(t.event_at)&&t.reference_station==='Melbourne (Williamstown)').sort((a,b)=>Date.parse(a.event_at)-Date.parse(b.event_at));
+  const previous=[...sorted].reverse().find(t=>Date.parse(t.event_at)<=ts);
+  const next=sorted.find(t=>Date.parse(t.event_at)>ts);
+  const closest=[previous,next].filter(Boolean).sort((a,b)=>Math.abs(Date.parse(a.event_at)-ts)-Math.abs(Date.parse(b.event_at)-ts))[0];
+  if (!closest || Math.abs(Date.parse(closest.event_at)-ts)>12*3600000) return null;
+  // Rising/falling is a reference-station inference between successive verified extrema.
+  const direction=previous&&next&&previous.event_type!==next.event_type&&
+    (Date.parse(next.event_at)-Date.parse(previous.event_at))<=12*3600000
+    ? (next.event_type==='high'?'rising':'falling') : 'unknown';
+  const minutesToNext=next ? Math.max(0,Math.round((Date.parse(next.event_at)-ts)/60000)) : null;
+  return { type:closest.event_type, at:closest.event_at, height_m:closest.height_m,
+    previous_type:previous?.event_type||null,previous_at:previous?.event_at||null,previous_height_m:previous?.height_m??null,
+    next_type:next?.event_type||null,next_at:next?.event_at||null,next_height_m:next?.height_m??null,
+    minutes_to_next:minutesToNext,
+    direction,hours_from_event:+((ts-Date.parse(closest.event_at))/3600000).toFixed(1),
+    station:closest.reference_station, source:closest.source_name, datum:closest.datum,
+    verified_reference:true, local_entrance_prediction:false };
 }
 function clarityEstimate(p) {
   // Wind/wave proxies do not measure turbidity. Don't create a fictitious clarity number.
@@ -60,6 +74,6 @@ export function buildBiteTimeline({weather,marine,checkedAt,tides=[],site='carru
       confidence:confidence(p,ageHours,tide,completeness),species:scores,provisional_fishing_weather:weatherGate,
       launch_status:'unverified', warning:'Do not treat a high bite score as launch clearance.' });
   }
-  return {site,checked_at:checkedAt,generated_at:now,hours,source:'Stored Open-Meteo weather/marine forecast + approximate SunCalc astronomy + manually verified BOM reference tides if available',
+  return {site,checked_at:checkedAt,generated_at:now,hours,source:'Stored Open-Meteo weather/marine forecast + approximate SunCalc astronomy + verified BOM Williamstown reference tides if imported',
     status:hours.length?'ok':'no_hours',safety_verified:false,clarity_measured:false,tide_station_is_entrance:false};
 }

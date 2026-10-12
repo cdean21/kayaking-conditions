@@ -1,0 +1,28 @@
+name: Parks Victoria notice ingest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch and ingest Parks Victoria notices
+        env:
+          BOM_INGEST_TOKEN: ${{ secrets.BOM_INGEST_TOKEN }}
+          WORKER_URL: https://kayaking-conditions.delicate-meadow-3eb1.workers.dev
+        run: |
+          python tools/fetch_parks_notices.py \
+            --worker "$WORKER_URL" \
+            --token "$BOM_INGEST_TOKEN"
