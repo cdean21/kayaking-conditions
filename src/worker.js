@@ -88,44 +88,42 @@ function points(data) {
     });
   });
 }
-function assess(p, a) {
-  const reasons = [];
-  if (p.wind === null || p.gust === null || p.wave_m === null) return { ok:false, reasons:['Missing essential forecast values'] };
-  if (p.wind < a.min || p.wind > a.max) reasons.push('Sustained wind outside preference');
-  // Conservative provisional filters. Not certified safety thresholds.
-  if (p.gust > (a.id === 'sailing' ? 24 : 16)) reasons.push('Gusts above provisional preference');
-  if (p.wave_m > (a.id === 'sailing' ? 0.7 : 0.4)) reasons.push('Modelled waves above provisional preference');
-  if ((p.precipitation ?? 0) >= 2) reasons.push('Heavy precipitation forecast');
-  if ([95,96,99].includes(p.weather_code)) reasons.push('Thunderstorm weather code');
-  if (!p.is_day || !daylight(p.time,p.sunrise,p.sunset)) reasons.push('Outside daylight');
-  if (!eligible(p.time)) reasons.push('Outside preferred outing hours');
-  return { ok: reasons.length === 0, reasons };
+function windowQuality(statuses){
+  return statuses.every(s=>s==='preferred')?'preferred':'marginal';
 }
-function buildOpportunities(data) {
-  const result = [];
-  const now = Date.now();
-  for (const site of SITES) for (const activity of ACTIVITIES) {
-    const ps = points(data).filter(p => p.site === site.id && new Date(p.time).getTime() >= now)
-      .sort((a,b) => a.time.localeCompare(b.time));
-    let run = [];
-    function flush() {
-      if (run.length < 2) { run = []; return; }
-      const start = run[0].time;
-      const end = new Date(new Date(run.at(-1).time).getTime() + 3600000).toISOString();
-      if (hours(start,end) < 2) { run=[]; return; }
-      const avg = k => +(run.reduce((s,p) => s + (p[k] || 0),0)/run.length).toFixed(1);
-      const peak = k => +Math.max(...run.map(p => p[k] || 0)).toFixed(1);
-      const details = { mean_wind_kn:avg('wind'), peak_gust_kn:peak('gust'), max_wave_m:peak('wave_m'), mean_wave_period_s:avg('wave_period_s'), sea_surface_temp_c:run.some(p=>p.sea_surface_temp_c !== null) ? +(run.filter(p=>p.sea_surface_temp_c !== null).reduce((a,p)=>a+p.sea_surface_temp_c,0)/run.filter(p=>p.sea_surface_temp_c !== null).length).toFixed(1) : null, wind_direction_deg:avg('direction'), forecast_only:true, safety_verified:false, missing_checks:['official marine warnings','local entrance conditions','site-specific tides and currents','live wind observations'] };
-      const key = `${site.id}:${activity.id}:${start.slice(0,13)}`;
-      const score = Math.max(0,Math.min(100,Math.round(85 - peak('gust') * .7 - peak('wave_m') * 12)));
-      result.push({ key, site_id:site.id, activity:activity.id, starts_at:start, ends_at:end, score, details });
-      run = [];
-    }
-    for (const p of ps) {
-      if (assess(p,activity).ok) {
-        if (run.length && hours(run.at(-1).time,p.time) !== 1) flush();
-        run.push(p);
-      } else flush();
+function opportunityScore(run,quality){
+  const peak=k=>Math.max(...run.map(x=>x.point[k]||0));
+  const base=quality==='preferred'?92:76;
+  return Math.max(0,Math.min(100,Math.round(base-peak('gust')*.35-peak('wave_m')*8)));
+}
+function buildOpportunities(data, official, noticesBySite) {
+  const result=[], now=Date.now();
+  for(const site of SITES) for(const activity of ACTIVITIES){
+    const ps=points(data).filter(p=>p.site===site.id&&Date.parse(p.time)>=now&&Date.parse(p.time)<=now+72*3600000).sort((a,b)=>a.time.localeCompare(b.time));
+    let run=[];
+    const flush=()=>{
+      if(run.length<2){run=[];return;}
+      const start=run[0].point.time,end=new Date(Date.parse(run.at(-1).point.time)+3600000).toISOString();
+      if(hours(start,end)<2){run=[];return;}
+      const avg=k=>+(run.reduce((n,x)=>n+(x.point[k]||0),0)/run.length).toFixed(1);
+      const peak=k=>+Math.max(...run.map(x=>x.point[k]||0)).toFixed(2);
+      const quality=windowQuality(run.map(x=>x.assessment.status));
+      const preferredHours=run.filter(x=>x.assessment.status==='preferred').length;
+      const marginalHours=run.length-preferredHours;
+      const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:start,
+        mean_wind_kn:avg('wind'),peak_gust_kn:peak('gust'),max_wave_m:peak('wave_m'),mean_wave_period_s:avg('wave_period_s'),
+        wind_direction_deg:avg('direction'),hourly:run.map(x=>({time:x.point.time,status:x.assessment.status,cautions:x.assessment.cautions,blockers:x.assessment.blockers})),
+        arrival_checks:run[0].assessment.arrival_checks||[],launch_verified:false,official_checks_included:true};
+      result.push({key:`${site.id}:${activity.id}:${start.slice(0,13)}`,site_id:site.id,activity:activity.id,starts_at:start,ends_at:end,score:opportunityScore(run,quality),details});
+      run=[];
+    };
+    for(const p of ps){
+      if(!eligible(p.time)||!p.is_day||!daylight(p.time,p.sunrise,p.sunset)){flush();continue;}
+      const assessment=assessLaunch({site:site.id,activity:activity.id,official,notices:noticesBySite[site.id],point:p,forecastCheckedAt:stamp(),at:p.time});
+      if(['preferred','marginal'].includes(assessment.status)){
+        if(run.length&&hours(run.at(-1).point.time,p.time)!==1)flush();
+        run.push({point:p,assessment});
+      }else flush();
     }
     flush();
   }
@@ -253,8 +251,15 @@ async function currentLaunchAssessment(env, site='carrum-foreshore', activity='f
 async function run(env) {
   try {
     const official = await readOfficialMarineSnapshot(env);
-    const data = await collect();
-    const opportunities = buildOpportunities(data);
+    const [carrumNotices,pattersonNotices,data] = await Promise.all([
+      readLocalNotices(env,'carrum-foreshore'),
+      readLocalNotices(env,'patterson-river'),
+      collect()
+    ]);
+    const opportunities = buildOpportunities(data,official,{
+      'carrum-foreshore':carrumNotices,
+      'patterson-river':pattersonNotices
+    });
     const changes = await store(env,data,opportunities);
     const delivery = await deliverPendingAlerts(env);
     return { checked_at:stamp(), candidates:opportunities.length, change_events:changes, delivery, official_marine:official, safety_verified:false, note:'Forecast run reads the latest validated BOM snapshot from D1 and never waits on FTP. Missing or stale BOM data blocks positive alerts. Patterson River entrance/live launch conditions remain a separate safety gate.' };
@@ -274,6 +279,17 @@ export default {
       if (u.pathname === '/' || u.pathname === '/dashboard') return new Response(dashboard,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
       if (u.pathname === '/api/health') return json({ ok:true, service:'kayaking-conditions', time:stamp() });
       if (u.pathname === '/api/sites') return json({ sites:SITES, marine_sample:MARINE_SAMPLE, note:'Coordinates are approximate and require verification.' });
+      if (u.pathname === '/api/opportunity-preview' && request.method === 'GET') {
+        const official=await readOfficialMarineSnapshot(env);
+        const [carrumNotices,pattersonNotices,row]=await Promise.all([
+          readLocalNotices(env,'carrum-foreshore'),readLocalNotices(env,'patterson-river'),
+          env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first()
+        ]);
+        if(!row) return json({error:'No stored forecast'},404);
+        const data={weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json)};
+        const windows=buildOpportunities(data,official,{'carrum-foreshore':carrumNotices,'patterson-river':pattersonNotices});
+        return json({checked_at:row.checked_at,horizon_hours:72,min_window_hours:2,availability:'Weekends daylight; Wed/Fri after 16:00; Mon/Tue/Thu after 17:00 Melbourne time',alerts_enabled:env.ALERTS_ENABLED==='true',windows});
+      }
       if (u.pathname === '/api/opportunities') {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
         return json({ safety_verified:false, opportunities:rows.results.map(x=>({ ...x, details:JSON.parse(x.details_json), details_json:undefined })) });
