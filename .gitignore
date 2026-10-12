@@ -7,3 +7,9 @@ node_modules/
 *.log
 williamstown_2026_REVIEW.csv
 src/worker.js.backup-*
+
+# Local development / patch artifacts
+README.txt
+worker-current.txt
+/worker.js
+patch_*.txt
