@@ -423,7 +423,7 @@ async function positiveAlertGate(env,row,details){
   }
   return {ok:true,candidate:{key:candidate.opportunity_key,site_id:candidate.site_id,activity:candidate.activity,starts_at:candidate.starts_at,ends_at:candidate.ends_at,score:candidate.score,details:currentDetails},assessment};
 }
-const ALERT_ACTIVATION_EVENT_ID = 55;
+const ALERT_ACTIVATION_EVENT_ID = 56;
 const NEGATIVE_ALERT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const DELIVERY_CLAIM_MAX_AGE_MS = 15 * 60 * 1000;
 
