@@ -93,6 +93,27 @@ function points(data) {
     });
   });
 }
+function verifiedTideContext(at,tides=[]){
+  const target=Date.parse(at);
+  if(!Number.isFinite(target)) return {status:'missing',reference_station:'Melbourne (Williamstown)',reason:'invalid assessment time'};
+  const sorted=(tides||[]).filter(t=>t?.reference_station==='Melbourne (Williamstown)'&&Number.isFinite(Date.parse(t.event_at))&&['high','low'].includes(t.event_type)&&Number.isFinite(Number(t.height_m))).sort((a,b)=>Date.parse(a.event_at)-Date.parse(b.event_at));
+  let previous=null,next=null;
+  for(const t of sorted){const ms=Date.parse(t.event_at);if(ms<=target)previous=t;if(ms>target){next=t;break;}}
+  if(!previous||!next) return {status:'missing',reference_station:'Melbourne (Williamstown)',reason:'verified tide turning points do not bracket this hour'};
+  const a=Date.parse(previous.event_at),b=Date.parse(next.event_at);
+  if(!(b>a)||target-a>9*3600000||b-target>9*3600000) return {status:'missing',reference_station:'Melbourne (Williamstown)',reason:'verified tide turning points are too distant to cover this hour'};
+  const fraction=Math.max(0,Math.min(1,(target-a)/(b-a)));
+  const smooth=(1-Math.cos(Math.PI*fraction))/2;
+  const estimated=Number(previous.height_m)+(Number(next.height_m)-Number(previous.height_m))*smooth;
+  return {status:'verified_reference',reference_station:'Melbourne (Williamstown)',datum:previous.datum||next.datum||null,direction:next.event_type==='high'?'rising':'falling',estimated_height_m:+estimated.toFixed(2),previous_type:previous.event_type,previous_at:previous.event_at,previous_height_m:Number(previous.height_m),next_type:next.event_type,next_at:next.event_at,next_height_m:Number(next.height_m),minutes_to_next:Math.max(0,Math.round((b-target)/60000)),entrance_measurement:false,note:'BOM Melbourne (Williamstown) reference prediction only — not a Patterson River entrance depth/current measurement.'};
+}
+async function readVerifiedTides(env,startAt,endAt){
+  const start=new Date(Date.parse(startAt)-12*3600000).toISOString();
+  const end=new Date(Date.parse(endAt)+12*3600000).toISOString();
+  const rows=await env.DB.prepare(`SELECT reference_station,event_at,event_type,height_m,datum,source_name,source_url FROM tbl_verified_tides WHERE reference_station='Melbourne (Williamstown)' AND datetime(event_at) >= datetime(?) AND datetime(event_at) <= datetime(?) ORDER BY datetime(event_at) LIMIT 100`).bind(start,end).all();
+  return rows.results||[];
+}
+
 function environmentalStatus(assessment){
   if(assessment.status==='blocked'||assessment.status==='incomplete') return assessment.status;
   const environmentalCautions=(assessment.cautions||[]).filter(c=>!c.startsWith('Local navigation advisory'));
@@ -106,7 +127,59 @@ function opportunityScore(run,quality){
   const base=quality==='preferred'?92:76;
   return Math.max(0,Math.min(100,Math.round(base-peak('gust')*.35-peak('wave_m')*8)));
 }
-function buildOpportunities(data, official, noticesBySite, forecastCheckedAt=data?.checkedAt) {
+
+function bomPeriodAt(official, at){
+  const t=Date.parse(at);
+  return (official?.forecast?.periods||[]).find(p=>{
+    const start=Date.parse(p.start_at), end=Date.parse(p.end_at);
+    return Number.isFinite(start)&&Number.isFinite(end)&&t>=start&&t<end;
+  })||null;
+}
+
+function bomUpperWindKn(text){
+  if(typeof text !== 'string') return null;
+  const values = [...text.matchAll(/(\d+(?:\.\d+)?)\s*(?:knots?|kt)\b/gi)]
+    .map(m => Number(m[1]))
+    .filter(Number.isFinite);
+  return values.length ? Math.max(...values) : null;
+}
+
+function bomUpperSeaM(text){
+  if(typeof text !== 'string') return null;
+  const values = [...text.matchAll(/(\d+(?:\.\d+)?)\s*(?:metres?|meters?|m)\b/gi)]
+    .map(m => Number(m[1]))
+    .filter(Number.isFinite);
+  return values.length ? Math.max(...values) : null;
+}
+
+function bomCrossCheck(official, point, activity){
+  const period=bomPeriodAt(official,point.time);
+  if(!period) return {material:false,reason:null,period:null,bom_wind_upper_kn:null,bom_seas_upper_m:null};
+
+  const bomWind=bomUpperWindKn(period.winds);
+  const bomSea=bomUpperSeaM(period.seas);
+  const modelWind=Number(point.wind);
+  const modelWave=Number(point.wave_m);
+
+  // Broad Port Phillip forecasts are a conservative cross-check, not a Carrum/Patterson measurement.
+  // Only downgrade a preferred hour when the official forecast is materially rougher.
+  const windMaterial=Number.isFinite(bomWind)&&Number.isFinite(modelWind)&&bomWind>=modelWind+5;
+  const seaMaterial=Number.isFinite(bomSea)&&Number.isFinite(modelWave)&&bomSea>=modelWave+0.3;
+  if(!windMaterial&&!seaMaterial) return {material:false,reason:null,period,bom_wind_upper_kn:bomWind,bom_seas_upper_m:bomSea};
+
+  const parts=[];
+  if(windMaterial) parts.push(`BOM Port Phillip winds up to ${bomWind} kn vs numerical model ${modelWind.toFixed(1)} kn`);
+  if(seaMaterial) parts.push(`BOM Port Phillip seas up to ${bomSea.toFixed(1)} m vs numerical model ${modelWave.toFixed(2)} m`);
+  return {
+    material:true,
+    reason:`Official Port Phillip local-waters forecast is materially rougher: ${parts.join('; ')}.`,
+    period,
+    bom_wind_upper_kn:bomWind,
+    bom_seas_upper_m:bomSea
+  };
+}
+
+function buildOpportunities(data, official, noticesBySite, tides=[], forecastCheckedAt=data?.checkedAt) {
   const result=[], now=Date.now();
   const forecastCheckedMs=Date.parse(forecastCheckedAt || '');
   const forecastAgeMs=Number.isFinite(forecastCheckedMs) ? now-forecastCheckedMs : Infinity;
@@ -120,33 +193,58 @@ function buildOpportunities(data, official, noticesBySite, forecastCheckedAt=dat
       if(hours(start,end)<2){run=[];return;}
       const avg=k=>+(run.reduce((n,x)=>n+(x.point[k]||0),0)/run.length).toFixed(1);
       const peak=k=>+Math.max(...run.map(x=>x.point[k]||0)).toFixed(2);
-      const environmentalStatuses=run.map(x=>environmentalStatus(x.assessment));
+      const environmentalStatuses=run.map(x=>{
+        const base=environmentalStatus(x.assessment);
+        return base==='preferred'&&x.bomCrossCheck?.material?'marginal':base;
+      });
       const quality=windowQuality(environmentalStatuses);
       const preferredHours=environmentalStatuses.filter(x=>x==='preferred').length;
       const marginalHours=run.length-preferredHours;
       const ranked=[...run].sort((a,b)=>{
-        const as=environmentalStatus(a.assessment), bs=environmentalStatus(b.assessment);
+        const baseA=environmentalStatus(a.assessment), baseB=environmentalStatus(b.assessment);
+        const as=baseA==='preferred'&&a.bomCrossCheck?.material?'marginal':baseA;
+        const bs=baseB==='preferred'&&b.bomCrossCheck?.material?'marginal':baseB;
         if(as!==bs) return as==='preferred'?-1:1;
         const burden=x=>(x.point.wind||0)/10+(x.point.gust||0)/20+(x.point.wave_m||0)/.8;
         return burden(a)-burden(b) || a.point.time.localeCompare(b.point.time);
       });
       const bestDeparture=ranked[0]?.point.time||start;
       const advisories=[...new Set(run.flatMap(x=>(x.assessment.cautions||[]).filter(c=>c.startsWith('Local navigation advisory'))))];
-      const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:bestDeparture,advisories,
+      // Summarise each material BOM period once at window level; preserve precise hourly reasons below.
+      const materialHours=run.filter(x=>x.bomCrossCheck?.material);
+      const bomPeriodGroups=new Map();
+      for(const x of materialHours){
+        const period=x.bomCrossCheck.period;
+        const key=period?.start_at||'unknown';
+        if(!bomPeriodGroups.has(key)) bomPeriodGroups.set(key,{period,points:[]});
+        bomPeriodGroups.get(key).points.push(x.point);
+      }
+      const bomCrossChecks=[...bomPeriodGroups.values()].map(({period,points:matched})=>{
+        const range=(field,unit,digits)=>{
+          const vals=matched.map(p=>p[field]).filter(v=>typeof v==='number'&&Number.isFinite(v));
+          if(!vals.length) return 'unavailable';
+          const lo=Math.min(...vals).toFixed(digits),hi=Math.max(...vals).toFixed(digits);
+          return `${lo}${lo===hi?'':`–${hi}`} ${unit}`;
+        };
+        return `BOM Port Phillip local-waters forecast: winds ${period?.winds||'unavailable'} seas ${period?.seas||'unavailable'} Materially rougher than numerical model wind ${range('wind','kt',1)}, waves ${range('wave_m','m',2)}. Broad-area forecast, not a launch-site measurement.`;
+      });
+      const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:bestDeparture,advisories,bom_cross_check:bomCrossChecks,
         mean_wind_kn:avg('wind'),peak_gust_kn:peak('gust'),max_wave_m:peak('wave_m'),mean_wave_period_s:avg('wave_period_s'),
-        wind_direction_deg:avg('direction'),hourly:run.map(x=>({time:x.point.time,status:environmentalStatus(x.assessment),assessment_status:x.assessment.status,cautions:x.assessment.cautions,blockers:x.assessment.blockers})),
+        wind_direction_deg:avg('direction'),tide_reference:verifiedTideContext(bestDeparture,tides),hourly:run.map((x,i)=>({time:x.point.time,status:environmentalStatuses[i],assessment_status:x.assessment.status,tide:x.tide,cautions:[...(x.assessment.cautions||[]),...(x.bomCrossCheck?.reason?[x.bomCrossCheck.reason]:[])],blockers:x.assessment.blockers,bom_cross_check:x.bomCrossCheck?.material?{material:true,reason:x.bomCrossCheck.reason,winds:x.bomCrossCheck.period?.winds||null,seas:x.bomCrossCheck.period?.seas||null}:null})),
         arrival_checks:run[0].assessment.arrival_checks||[],return_buffer_minutes:RETURN_BUFFER_MINUTES,feasible_return_rule:'Window must end at least 30 minutes before forecast sunset',forecast_checked_at:forecastCheckedAt,launch_verified:false,official_checks_included:true};
-      result.push({key:`${site.id}:${activity.id}:${start.slice(0,13)}`,site_id:site.id,activity:activity.id,starts_at:start,ends_at:end,score:opportunityScore(run,quality),details});
+      result.push({key:`${site.id}:${activity.id}:${localDateKey(start)}`,site_id:site.id,activity:activity.id,starts_at:start,ends_at:end,score:opportunityScore(run,quality),details});
       run=[];
     };
     for(const p of ps){
       const hourEnd=Date.parse(p.time)+3600000;
       const returnDeadline=Date.parse(p.sunset)-RETURN_BUFFER_MINUTES*60000;
       if(!eligible(p.time)||!p.is_day||!daylight(p.time,p.sunrise,p.sunset)||!Number.isFinite(returnDeadline)||hourEnd>returnDeadline){flush();continue;}
-      const assessment=assessLaunch({site:site.id,activity:activity.id,official,notices:noticesBySite[site.id],point:p,forecastCheckedAt,at:p.time});
+      const tide=verifiedTideContext(p.time,tides);
+      const assessment=assessLaunch({site:site.id,activity:activity.id,official,notices:noticesBySite[site.id],point:p,forecastCheckedAt,at:p.time,tide});
+      const crossCheck=bomCrossCheck(official,p,activity);
       if(['preferred','marginal'].includes(assessment.status)){
         if(run.length&&hours(run.at(-1).point.time,p.time)!==1)flush();
-        run.push({point:p,assessment});
+        run.push({point:p,assessment,bomCrossCheck:crossCheck,tide});
       }else flush();
     }
     flush();
@@ -247,27 +345,291 @@ async function sendPushover(env, { title, message, priority = 0, url }) {
   }
   return { status: 'sent', request: payload.request || null };
 }
+function localWindowLabel(start,end){
+  if(!start||!end)return 'time unavailable';
+  const day=fmt(start,{weekday:'short',day:'numeric',month:'short'});
+  const a=fmt(start,{hour:'numeric',minute:'2-digit'});
+  const b=fmt(end,{hour:'numeric',minute:'2-digit'});
+  return `${day}, ${a}–${b}`;
+}
+function activityLabel(id){ return id==='kayaking'?'Kayaking':id==='sailing'?'Sailing':id==='fishing'?'Fishing':'Hobie outing'; }
+function siteLabel(id){ return SITES.find(s=>s.id===id)?.name || id || 'Carrum'; }
+function conditionSummary(d={}){
+  const bits=[];
+  if(Number.isFinite(Number(d.mean_wind_kn))) bits.push(`wind ~${Number(d.mean_wind_kn).toFixed(1)} kt`);
+  if(Number.isFinite(Number(d.peak_gust_kn))) bits.push(`gusts ${Number(d.peak_gust_kn).toFixed(1)} kt`);
+  if(Number.isFinite(Number(d.max_wave_m))) bits.push(`waves to ${Number(d.max_wave_m).toFixed(2)} m`);
+  return bits.join(', ');
+}
+function tideSummary(d={}){
+  const t=d.tide_reference;
+  if(!t||t.status!=='verified_reference') return '';
+  const height=Number.isFinite(Number(t.estimated_height_m))?`~${Number(t.estimated_height_m).toFixed(2)} m LAT`:'height unavailable';
+  const nextHeight=Number.isFinite(Number(t.next_height_m))?`${Number(t.next_height_m).toFixed(2)} m LAT `:'';
+  const next=t.next_type&&t.next_at?`; ${t.next_type} ${nextHeight}at ${fmt(t.next_at,{hour:'numeric',minute:'2-digit'})}`:'';
+  return `Williamstown reference tide: ${t.direction||'state unknown'}, ${height}${next}.`;
+}
+function formatAlert(eventType,payload){
+  const current=eventType==='CANCELLED' ? null : payload;
+  const previous=payload.previous || null;
+  const base=current || previous || payload;
+  const site=siteLabel(base.site_id || payload.site_id || previous?.site_id);
+  const activity=activityLabel(base.activity || payload.activity || previous?.activity);
+  const window=localWindowLabel(base.starts_at,base.ends_at);
+  const d=base.details || {};
+  const conditions=conditionSummary(d);
+  const tide=tideSummary(d);
+  const arrival=(d.arrival_checks||[])[0];
+  const caveat=(d.bom_cross_check||[])[0];
+  let title,lead;
+  if(eventType==='NEW_OPPORTUNITY'){
+    title=`Hobie: new ${activity.toLowerCase()} window`;
+    lead=`New ${d.classification||'qualifying'} forecast opportunity at ${site}: ${window}.`;
+  } else if(eventType==='IMPROVED'){
+    title=`Hobie: ${activity.toLowerCase()} window improved`;
+    lead=`Forecast opportunity at ${site} has improved: ${window}${d.classification?` (${d.classification})`:''}.`;
+  } else if(eventType==='DETERIORATING'){
+    title=`Hobie: ${activity.toLowerCase()} window deteriorating`;
+    const oldClass=previous?.details?.classification, newClass=d.classification;
+    const change=oldClass&&newClass&&oldClass!==newClass?` ${oldClass} → ${newClass}.`:'';
+    lead=`Forecast opportunity at ${site} has deteriorated: ${window}.${change}`;
+  } else {
+    title=`Hobie: ${activity.toLowerCase()} window cancelled`;
+    lead=`The previously identified forecast opportunity at ${site} (${window}) no longer has at least two consecutive usable hours.`;
+  }
+  const parts=[lead];
+  if(conditions) parts.push(`${conditions}.`);
+  if(tide) parts.push(tide);
+  if(caveat) parts.push(caveat);
+  if(arrival) parts.push(arrival);
+  parts.push('Forecast guidance only — recheck BOM warnings and actual launch conditions before departure.');
+  return {title,message:parts.join(' ').slice(0,1024),priority:0};
+}
+async function positiveAlertGate(env,row,details){
+  if(!isStableOpportunityKey(row.opportunity_key)) return {ok:false,permanent:true,reason:'unstable opportunity key'};
+  const candidate=await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE opportunity_key=? AND status='candidate' AND ends_at > ?").bind(row.opportunity_key,stamp()).first();
+  if(!candidate) return {ok:false,permanent:true,reason:'opportunity is no longer current'};
+  const currentDetails=parseDetails(candidate);
+  const forecastAt=Date.parse(currentDetails.forecast_checked_at||'');
+  if(!Number.isFinite(forecastAt)||Date.now()-forecastAt>FORECAST_MAX_AGE_MS) return {ok:false,permanent:false,reason:'numerical forecast is stale'};
+  const official=await readOfficialMarineSnapshot(env);
+  if(official.stale || official.status!=='verified_no_port_phillip_warning' || official.warning?.port_phillip_warning_active || official.positive_alert_gate!=='warning_check_passed'){
+    return {ok:false,permanent:false,reason:'official BOM positive-alert gate is blocked'};
+  }
+  const at=currentDetails.best_departure||candidate.starts_at;
+  const assessment=await currentLaunchAssessment(env,candidate.site_id,candidate.activity,at);
+  if(!assessment || !['preferred','marginal'].includes(assessment.status) || (assessment.blockers||[]).length){
+    return {ok:false,permanent:false,reason:'current launch assessment is blocked or incomplete'};
+  }
+  return {ok:true,candidate:{key:candidate.opportunity_key,site_id:candidate.site_id,activity:candidate.activity,starts_at:candidate.starts_at,ends_at:candidate.ends_at,score:candidate.score,details:currentDetails},assessment};
+}
+const ALERT_ACTIVATION_EVENT_ID = 55;
+const NEGATIVE_ALERT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const DELIVERY_CLAIM_MAX_AGE_MS = 15 * 60 * 1000;
+
+function eventAgeMs(row){
+  const t=Date.parse(row.created_at||'');
+  return Number.isFinite(t) ? Date.now()-t : Infinity;
+}
+async function newestPendingEventIds(env){
+  const rows=await env.DB.prepare(`SELECT opportunity_key, MAX(id) AS newest_id FROM tbl_alert_events
+    WHERE delivery_status='pending' AND event_type IN ('NEW_OPPORTUNITY','IMPROVED','DETERIORATING','CANCELLED')
+    GROUP BY opportunity_key`).all();
+  return new Map((rows.results||[]).map(r=>[r.opportunity_key,Number(r.newest_id)]));
+}
+function queueGate(row,newestByKey){
+  if(!isStableOpportunityKey(row.opportunity_key)) return {ok:false,permanent:true,status:'suppressed_legacy',reason:'unstable or legacy opportunity key'};
+  if(Number(row.id)<=ALERT_ACTIVATION_EVENT_ID) return {ok:false,permanent:true,status:'suppressed_activation_backlog',reason:`predates notification activation boundary (event ${ALERT_ACTIVATION_EVENT_ID})`};
+  if(newestByKey.get(row.opportunity_key)!==Number(row.id)) return {ok:false,permanent:true,status:'suppressed_superseded',reason:'a newer pending event exists for this opportunity'};
+  if((row.event_type==='DETERIORATING'||row.event_type==='CANCELLED') && eventAgeMs(row)>NEGATIVE_ALERT_MAX_AGE_MS){
+    return {ok:false,permanent:true,status:'suppressed_stale',reason:'negative event is older than 6 hours'};
+  }
+  return {ok:true,permanent:false,status:null,reason:null};
+}
+async function expireAbandonedDeliveryClaims(env) {
+  const cutoff = new Date(Date.now() - DELIVERY_CLAIM_MAX_AGE_MS).toISOString();
+
+  const result = await env.DB.prepare(`
+    UPDATE tbl_alert_events
+    SET delivery_status='delivery_unknown',
+        delivery_error='Delivery claim expired before a confirmed result; not automatically resent.'
+    WHERE delivery_status='sending'
+      AND (
+        delivery_claimed_at IS NULL
+        OR datetime(delivery_claimed_at) < datetime(?)
+      )
+  `).bind(cutoff).run();
+
+  return Number(result?.meta?.changes || 0);
+}
+
 async function deliverPendingAlerts(env) {
   if (env.ALERTS_ENABLED !== 'true') return { sent: 0, note: 'Alerts disabled' };
-  // Positive events are blocked until independent safety checks exist.
-  // This avoids sending a misleading 'good to go' notification from forecast-only data.
-  const rows = await env.DB.prepare(`SELECT id, event_type, details_json FROM tbl_alert_events
-    WHERE delivery_status='pending' AND event_type IN ('DETERIORATING','CANCELLED')
-    ORDER BY id ASC LIMIT 20`).all();
-  let sent = 0;
-  for (const row of rows.results) {
-    const details = JSON.parse(row.details_json || '{}');
-    const site = SITES.find(s => s.id === (details.site_id || details.previous?.site_id));
-    const activity = details.activity || details.previous?.activity || 'Hobie outing';
-    const result = await sendPushover(env, {
-      title: 'Hobie: conditions deteriorating',
-      message: `${activity} at ${site?.name || 'Carrum'}: a previously identified forecast window no longer meets the provisional conditions. Recheck official marine warnings and local conditions before departure.`,
-      priority: 0
-    });
-    await env.DB.prepare(`UPDATE tbl_alert_events SET delivery_status='sent' WHERE id=?`).bind(row.id).run();
-    sent++;
+
+  // A stranded sending row is deliberately NOT returned to pending.
+  // Once Pushover may have been contacted, automatic retry could duplicate an alert.
+  const deliveryUnknown = await expireAbandonedDeliveryClaims(env);
+
+  const rows = await env.DB.prepare(`
+    SELECT id, opportunity_key, event_type, created_at, details_json
+    FROM tbl_alert_events
+    WHERE delivery_status='pending'
+      AND event_type IN ('NEW_OPPORTUNITY','IMPROVED','DETERIORATING','CANCELLED')
+    ORDER BY id ASC
+    LIMIT 50
+  `).all();
+
+  const newestByKey = await newestPendingEventIds(env);
+  let sent = 0, deferred = 0, suppressed = 0, claimedElsewhere = 0, failed = 0;
+
+  for (const row of rows.results || []) {
+    const q = queueGate(row, newestByKey);
+
+    if (!q.ok) {
+      await env.DB.prepare(`
+        UPDATE tbl_alert_events
+        SET delivery_status=?,
+            delivery_error=?
+        WHERE id=? AND delivery_status='pending'
+      `).bind(q.status, q.reason || null, row.id).run();
+
+      suppressed++;
+      continue;
+    }
+
+    let details;
+    try {
+      details = JSON.parse(row.details_json || '{}');
+    } catch {
+      details = {};
+    }
+
+    let payload = details;
+
+    if (row.event_type === 'NEW_OPPORTUNITY' || row.event_type === 'IMPROVED') {
+      const gate = await positiveAlertGate(env, row, details);
+
+      if (!gate.ok) {
+        if (gate.permanent) {
+          const suppressionStatus =
+            gate.reason === 'opportunity is no longer current'
+              ? 'suppressed_obsolete'
+              : 'suppressed_stale';
+
+          await env.DB.prepare(`
+            UPDATE tbl_alert_events
+            SET delivery_status=?,
+                delivery_error=?
+            WHERE id=? AND delivery_status='pending'
+          `).bind(suppressionStatus, gate.reason || null, row.id).run();
+
+          suppressed++;
+        } else {
+          deferred++;
+        }
+
+        continue;
+      }
+
+      payload = { ...gate.candidate, previous: details.previous || null };
+    }
+
+    const claimedAt = stamp();
+
+    // Atomic pending -> sending claim. Only the invocation that changes one row
+    // is permitted to contact Pushover.
+    const claim = await env.DB.prepare(`
+      UPDATE tbl_alert_events
+      SET delivery_status='sending',
+          delivery_claimed_at=?,
+          delivery_error=NULL,
+          pushover_request_id=NULL
+      WHERE id=? AND delivery_status='pending'
+    `).bind(claimedAt, row.id).run();
+
+    const claimed = Number(claim?.meta?.changes || 0) === 1;
+
+    if (!claimed) {
+      claimedElsewhere++;
+      continue;
+    }
+
+    const formatted = formatAlert(row.event_type, payload);
+
+    try {
+      const result = await sendPushover(env, formatted);
+
+      await env.DB.prepare(`
+        UPDATE tbl_alert_events
+        SET delivery_status='sent',
+            delivery_error=NULL,
+            pushover_request_id=?
+        WHERE id=? AND delivery_status='sending'
+      `).bind(result?.request || null, row.id).run();
+
+      sent++;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+
+      // Do not automatically retry after Pushover may have been contacted.
+      // A timeout/network error can occur after the remote service accepted
+      // the message, so pending would create a duplicate-delivery risk.
+      await env.DB.prepare(`
+        UPDATE tbl_alert_events
+        SET delivery_status='delivery_unknown',
+            delivery_error=?
+        WHERE id=? AND delivery_status='sending'
+      `).bind(error.slice(0, 1000), row.id).run();
+
+      failed++;
+
+      console.error('Pushover delivery outcome unknown', {
+        alert_event_id: row.id,
+        opportunity_key: row.opportunity_key,
+        event_type: row.event_type,
+        error
+      });
+    }
   }
-  return { sent };
+
+  return {
+    sent,
+    deferred,
+    suppressed,
+    claimed_elsewhere: claimedElsewhere,
+    failed,
+    delivery_unknown_from_expired_claims: deliveryUnknown
+  };
+}
+async function previewPendingAlerts(env){
+  const rows=await env.DB.prepare(`SELECT id,opportunity_key,event_type,created_at,delivery_status,details_json FROM tbl_alert_events
+    WHERE delivery_status='pending' AND event_type IN ('NEW_OPPORTUNITY','IMPROVED','DETERIORATING','CANCELLED') ORDER BY id ASC LIMIT 100`).all();
+  const newestByKey=await newestPendingEventIds(env);
+  const out=[];
+  for(const row of rows.results||[]){
+    let details; try{details=JSON.parse(row.details_json||'{}')}catch{details={}};
+    const q=queueGate(row,newestByKey);
+    let gate=q, payload=details;
+    if(q.ok && (row.event_type==='NEW_OPPORTUNITY'||row.event_type==='IMPROVED')){
+      gate=await positiveAlertGate(env,row,details);
+      if(gate.ok) payload={...gate.candidate,previous:details.previous||null};
+    } else if(q.ok) {
+      gate={ok:true,permanent:false,reason:'negative event is current and within the 6-hour delivery window'};
+    }
+    out.push({
+      id:row.id,opportunity_key:row.opportunity_key,event_type:row.event_type,created_at:row.created_at,delivery_status:row.delivery_status,
+      queue_action:!q.ok
+  ? q.status
+  : gate.ok
+    ? 'eligible'
+    : gate.permanent
+      ? 'suppressed_obsolete'
+      : 'deferred',
+      gate:{ok:gate.ok,permanent:!!gate.permanent,reason:gate.reason||null},
+      formatted:formatAlert(row.event_type,payload)
+    });
+  }
+  return out;
 }
 const BOM_SNAPSHOT_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 
@@ -309,26 +671,33 @@ function forecastPointForSite(row, site, at=new Date().toISOString()) {
   return {time:mt+'Z',wind:w.wind_speed_10m?.[wi]??null,gust:w.wind_gusts_10m?.[wi]??null,direction:w.wind_direction_10m?.[wi]??null,precipitation:w.precipitation?.[wi]??null,weather_code:w.weather_code?.[wi]??null,is_day:w.is_day?.[wi]===1,wave_m:mi>=0?(mh.wave_height?.[mi]??null):null};
 }
 async function currentLaunchAssessment(env, site='carrum-foreshore', activity='fishing', at=new Date().toISOString()) {
-  const [official,notices,row]=await Promise.all([
+  const tideStart=new Date(Date.parse(at)-12*3600000).toISOString();
+  const tideEnd=new Date(Date.parse(at)+12*3600000).toISOString();
+  const [official,notices,row,tides]=await Promise.all([
     readOfficialMarineSnapshot(env), readLocalNotices(env,site),
-    env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first()
+    env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first(),
+    readVerifiedTides(env,tideStart,tideEnd)
   ]);
   const point=forecastPointForSite(row,site,at);
-  return assessLaunch({site,activity,official,notices,point,forecastCheckedAt:row?.checked_at,at});
+  const tide=verifiedTideContext(at,tides);
+  return assessLaunch({site,activity,official,notices,point,forecastCheckedAt:row?.checked_at,at,tide});
 }
 
 async function run(env) {
   try {
     const official = await readOfficialMarineSnapshot(env);
-    const [carrumNotices,pattersonNotices,data] = await Promise.all([
+    const tideStart=new Date(Date.now()-12*3600000).toISOString();
+    const tideEnd=new Date(Date.now()+84*3600000).toISOString();
+    const [carrumNotices,pattersonNotices,data,tides] = await Promise.all([
       readLocalNotices(env,'carrum-foreshore'),
       readLocalNotices(env,'patterson-river'),
-      collect()
+      collect(),
+      readVerifiedTides(env,tideStart,tideEnd)
     ]);
     const opportunities = buildOpportunities(data,official,{
       'carrum-foreshore':carrumNotices,
       'patterson-river':pattersonNotices
-    },data.checkedAt);
+    },tides,data.checkedAt);
     const changes = await store(env,data,opportunities);
     const delivery = await deliverPendingAlerts(env);
     return { checked_at:stamp(), candidates:opportunities.length, change_events:changes, delivery, official_marine:official, safety_verified:false, note:'Forecast run reads the latest validated BOM snapshot from D1 and never waits on FTP. Missing or stale BOM data blocks positive alerts. Patterson River entrance/live launch conditions remain a separate safety gate.' };
@@ -350,15 +719,27 @@ export default {
       if (u.pathname === '/api/sites') return json({ sites:SITES, marine_sample:MARINE_SAMPLE, note:'Coordinates are approximate and require verification.' });
       if (u.pathname === '/api/opportunity-preview' && request.method === 'GET') {
         const official=await readOfficialMarineSnapshot(env);
-        const [carrumNotices,pattersonNotices,row]=await Promise.all([
+        const tideStart=new Date(Date.now()-12*3600000).toISOString();
+        const tideEnd=new Date(Date.now()+84*3600000).toISOString();
+        const [carrumNotices,pattersonNotices,row,tides]=await Promise.all([
           readLocalNotices(env,'carrum-foreshore'),readLocalNotices(env,'patterson-river'),
-          env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first()
+          env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first(),
+          readVerifiedTides(env,tideStart,tideEnd)
         ]);
         if(!row) return json({error:'No stored forecast'},404);
         const data={weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json),checkedAt:row.checked_at};
-        const windows=buildOpportunities(data,official,{'carrum-foreshore':carrumNotices,'patterson-river':pattersonNotices},row.checked_at);
+        const windows=buildOpportunities(data,official,{'carrum-foreshore':carrumNotices,'patterson-river':pattersonNotices},tides,row.checked_at);
         const forecastAgeMinutes=Math.max(0,Math.round((Date.now()-Date.parse(row.checked_at))/60000));
-        return json({checked_at:row.checked_at,forecast_age_minutes:Number.isFinite(forecastAgeMinutes)?forecastAgeMinutes:null,forecast_stale:!Number.isFinite(Date.parse(row.checked_at))||Date.now()-Date.parse(row.checked_at)>FORECAST_MAX_AGE_MS,horizon_hours:72,min_window_hours:2,return_buffer_minutes:RETURN_BUFFER_MINUTES,availability:'Weekends daylight; Wed/Fri after 16:00; Mon/Tue/Thu after 17:00 Melbourne time',alerts_enabled:env.ALERTS_ENABLED==='true',event_matching:'stable by site + activity + Melbourne local date; >=2h/10pt hysteresis',windows});
+        return json({
+          checked_at:row.checked_at,
+          forecast_age_minutes:Number.isFinite(forecastAgeMinutes)?forecastAgeMinutes:null,
+          forecast_stale:!Number.isFinite(Date.parse(row.checked_at))||Date.now()-Date.parse(row.checked_at)>FORECAST_MAX_AGE_MS,
+          horizon_hours:72,min_window_hours:2,return_buffer_minutes:RETURN_BUFFER_MINUTES,
+          availability:'Weekends daylight; Wed/Fri after 16:00; Mon/Tue/Thu after 17:00 Melbourne time',
+          alerts_enabled:env.ALERTS_ENABLED==='true',
+          event_matching:'stable by site + activity + Melbourne local date; >=2h/10pt hysteresis',
+          windows
+        });
       }
       if (u.pathname === '/api/opportunities') {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
@@ -435,6 +816,10 @@ export default {
         const row = await env.DB.prepare('SELECT id,checked_at,status,error FROM tbl_forecast_runs ORDER BY id DESC LIMIT 1').first();
         const [official,notices]=await Promise.all([readOfficialMarineSnapshot(env),readLocalNotices(env,'patterson-river')]);
         return json({ latest_run:row, official_marine_external_ingest:true,official_port_phillip_forecast_integrated:true,local_notices_integrated:true,official_safety_feeds_integrated:official.status==='verified_no_port_phillip_warning'&&notices.status==='no_unresolved_in_recent_listing', notifications_integrated:true, notifications_enabled:env.ALERTS_ENABLED === 'true', positive_alerts_blocked:true });
+      }
+      if (u.pathname === '/api/alerts/preview' && request.method === 'GET') {
+        if (!await auth(request,env)) return json({ error:'Unauthorized' },401);
+        return json({ alerts_enabled:env.ALERTS_ENABLED==='true', safety_verified:false, pending:await previewPendingAlerts(env) });
       }
       if (u.pathname === '/api/pushover/test' && request.method === 'POST') {
         if (!await auth(request,env)) return json({ error:'Unauthorized' },401);
