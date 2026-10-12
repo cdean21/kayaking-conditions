@@ -88,6 +88,11 @@ function points(data) {
     });
   });
 }
+function environmentalStatus(assessment){
+  if(assessment.status==='blocked'||assessment.status==='incomplete') return assessment.status;
+  const environmentalCautions=(assessment.cautions||[]).filter(c=>!c.startsWith('Local navigation advisory'));
+  return environmentalCautions.length?'marginal':'preferred';
+}
 function windowQuality(statuses){
   return statuses.every(s=>s==='preferred')?'preferred':'marginal';
 }
@@ -107,12 +112,21 @@ function buildOpportunities(data, official, noticesBySite) {
       if(hours(start,end)<2){run=[];return;}
       const avg=k=>+(run.reduce((n,x)=>n+(x.point[k]||0),0)/run.length).toFixed(1);
       const peak=k=>+Math.max(...run.map(x=>x.point[k]||0)).toFixed(2);
-      const quality=windowQuality(run.map(x=>x.assessment.status));
-      const preferredHours=run.filter(x=>x.assessment.status==='preferred').length;
+      const environmentalStatuses=run.map(x=>environmentalStatus(x.assessment));
+      const quality=windowQuality(environmentalStatuses);
+      const preferredHours=environmentalStatuses.filter(x=>x==='preferred').length;
       const marginalHours=run.length-preferredHours;
-      const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:start,
+      const ranked=[...run].sort((a,b)=>{
+        const as=environmentalStatus(a.assessment), bs=environmentalStatus(b.assessment);
+        if(as!==bs) return as==='preferred'?-1:1;
+        const burden=x=>(x.point.wind||0)/10+(x.point.gust||0)/20+(x.point.wave_m||0)/.8;
+        return burden(a)-burden(b) || a.point.time.localeCompare(b.point.time);
+      });
+      const bestDeparture=ranked[0]?.point.time||start;
+      const advisories=[...new Set(run.flatMap(x=>(x.assessment.cautions||[]).filter(c=>c.startsWith('Local navigation advisory'))))];
+      const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:bestDeparture,advisories,
         mean_wind_kn:avg('wind'),peak_gust_kn:peak('gust'),max_wave_m:peak('wave_m'),mean_wave_period_s:avg('wave_period_s'),
-        wind_direction_deg:avg('direction'),hourly:run.map(x=>({time:x.point.time,status:x.assessment.status,cautions:x.assessment.cautions,blockers:x.assessment.blockers})),
+        wind_direction_deg:avg('direction'),hourly:run.map(x=>({time:x.point.time,status:environmentalStatus(x.assessment),assessment_status:x.assessment.status,cautions:x.assessment.cautions,blockers:x.assessment.blockers})),
         arrival_checks:run[0].assessment.arrival_checks||[],launch_verified:false,official_checks_included:true};
       result.push({key:`${site.id}:${activity.id}:${start.slice(0,13)}`,site_id:site.id,activity:activity.id,starts_at:start,ends_at:end,score:opportunityScore(run,quality),details});
       run=[];
