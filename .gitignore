@@ -13,3 +13,9 @@ README.txt
 worker-current.txt
 /worker.js
 patch_*.txt
+
+# Local development / patch artifacts
+README.txt
+worker-current.txt
+/worker.js
+patch_*.txt
