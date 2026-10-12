@@ -143,29 +143,71 @@ function buildOpportunities(data, official, noticesBySite) {
   }
   return result;
 }
-async function store(env, data, opportunities) {
-  const now = stamp();
+function localDateKey(iso){
+  return new Intl.DateTimeFormat('en-CA',{timeZone:'Australia/Melbourne',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(iso));
+}
+function parseDetails(row){ try{return JSON.parse(row.details_json||'{}')}catch{return {}} }
+function overlapHours(aStart,aEnd,bStart,bEnd){
+  return Math.max(0,(Math.min(Date.parse(aEnd),Date.parse(bEnd))-Math.max(Date.parse(aStart),Date.parse(bStart)))/3600000);
+}
+function stableWindowKey(o){
+  return `${o.site_id}:${o.activity}:${localDateKey(o.starts_at)}`;
+}
+function matchPrior(o,rows,used){
+  const same=rows.filter(r=>!used.has(r.opportunity_key)&&r.site_id===o.site_id&&r.activity===o.activity&&localDateKey(r.starts_at)===localDateKey(o.starts_at));
+  if(!same.length)return null;
+  return same.sort((a,b)=>{
+    const ao=overlapHours(a.starts_at,a.ends_at,o.starts_at,o.ends_at),bo=overlapHours(b.starts_at,b.ends_at,o.starts_at,o.ends_at);
+    if(ao!==bo)return bo-ao;
+    return Math.abs(Date.parse(a.starts_at)-Date.parse(o.starts_at))-Math.abs(Date.parse(b.starts_at)-Date.parse(o.starts_at));
+  })[0];
+}
+function classifyChange(prior,o){
+  const pd=parseDetails(prior), nd=o.details||{};
+  const oldClass=pd.classification||'marginal', newClass=nd.classification||'marginal';
+  const oldDur=hours(prior.starts_at,prior.ends_at), newDur=hours(o.starts_at,o.ends_at);
+  const startShift=(Date.parse(o.starts_at)-Date.parse(prior.starts_at))/3600000;
+  const endShift=(Date.parse(o.ends_at)-Date.parse(prior.ends_at))/3600000;
+  // Hysteresis: ignore ordinary one-hour model wobble unless quality changes.
+  if(oldClass==='marginal'&&newClass==='preferred') return 'IMPROVED';
+  if(oldClass==='preferred'&&newClass==='marginal') return 'DETERIORATING';
+  if(newDur>=oldDur+2 || o.score>=prior.score+10 || startShift<=-2 || endShift>=2) return 'IMPROVED';
+  if(newDur<=oldDur-2 || o.score<=prior.score-10 || startShift>=2 || endShift<=-2) return 'DETERIORATING';
+  return null;
+}
+async function store(env,data,opportunities){
+  const now=stamp();
   await env.DB.prepare('INSERT INTO tbl_forecast_runs (checked_at,status,weather_json,marine_json) VALUES (?,?,?,?)')
     .bind(now,'ok',JSON.stringify(data.weather),JSON.stringify(data.marine)).run();
-  const active = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ?").bind(now).all();
-  const old = new Map(active.results.map(o => [o.opportunity_key,o]));
-  const keys = new Set();
-  let changes = 0;
-  for (const o of opportunities) {
-    keys.add(o.key);
-    const prior = old.get(o.key);
-    let event = null;
-    if (!prior) event = 'NEW_OPPORTUNITY';
-    else if (o.score >= prior.score + 10 || hours(o.starts_at,o.ends_at) >= hours(prior.starts_at,prior.ends_at) + 2) event = 'IMPROVED';
-    else if (o.score <= prior.score - 10 || hours(o.starts_at,o.ends_at) <= hours(prior.starts_at,prior.ends_at) - 2) event = 'DETERIORATING';
+  const active=await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ?").bind(now).all();
+  const rows=active.results||[], used=new Set(), surviving=new Set();
+  let changes=0;
+  for(const incoming of opportunities){
+    const o={...incoming,key:stableWindowKey(incoming)};
+    const prior=matchPrior(o,rows,used);
+    let event=prior?classifyChange(prior,o):'NEW_OPPORTUNITY';
+    const firstSeen=prior?.first_seen_at||now;
+    // If an older key matched, retire it before writing the stable key. This avoids a shifted start becoming cancel+new.
+    if(prior&&prior.opportunity_key!==o.key){
+      used.add(prior.opportunity_key);
+      await env.DB.prepare("UPDATE tbl_opportunities SET status='superseded',last_seen_at=? WHERE opportunity_key=?").bind(now,prior.opportunity_key).run();
+    } else if(prior) used.add(prior.opportunity_key);
+    surviving.add(o.key);
     await env.DB.prepare(`INSERT INTO tbl_opportunities (opportunity_key,site_id,activity,starts_at,ends_at,score,status,details_json,first_seen_at,last_seen_at)
-      VALUES (?,?,?,?,? ,?,'candidate',?,?,?) ON CONFLICT(opportunity_key) DO UPDATE SET ends_at=excluded.ends_at,score=excluded.score,status='candidate',details_json=excluded.details_json,last_seen_at=excluded.last_seen_at`)
-      .bind(o.key,o.site_id,o.activity,o.starts_at,o.ends_at,o.score,JSON.stringify(o.details),prior?.first_seen_at || now,now).run();
-    if (event) { await eventRow(env,o.key,event,{ ...o, prior_score:prior?.score ?? null }); changes++; }
+      VALUES (?,?,?,?,?,?,'candidate',?,?,?)
+      ON CONFLICT(opportunity_key) DO UPDATE SET starts_at=excluded.starts_at,ends_at=excluded.ends_at,score=excluded.score,status='candidate',details_json=excluded.details_json,last_seen_at=excluded.last_seen_at`)
+      .bind(o.key,o.site_id,o.activity,o.starts_at,o.ends_at,o.score,JSON.stringify(o.details),firstSeen,now).run();
+    if(event){
+      await eventRow(env,o.key,event,{...o,previous:prior?{key:prior.opportunity_key,starts_at:prior.starts_at,ends_at:prior.ends_at,score:prior.score,details:parseDetails(prior)}:null});
+      changes++;
+    }
   }
-  for (const o of active.results) if (!keys.has(o.opportunity_key)) {
-    await env.DB.prepare("UPDATE tbl_opportunities SET status='expired_or_deteriorated',last_seen_at=? WHERE opportunity_key=?").bind(now,o.opportunity_key).run();
-    await eventRow(env,o.opportunity_key,'DETERIORATING_OR_CANCELLED',{ previous: o, note:'Previously detected forecast window no longer meets provisional model criteria; re-check sources.' }); changes++;
+  for(const prior of rows){
+    if(used.has(prior.opportunity_key)||surviving.has(prior.opportunity_key))continue;
+    // A still-future previously qualifying window has disappeared entirely: cancellation, not mere deterioration.
+    await env.DB.prepare("UPDATE tbl_opportunities SET status='cancelled',last_seen_at=? WHERE opportunity_key=?").bind(now,prior.opportunity_key).run();
+    await eventRow(env,prior.opportunity_key,'CANCELLED',{previous:{key:prior.opportunity_key,site_id:prior.site_id,activity:prior.activity,starts_at:prior.starts_at,ends_at:prior.ends_at,score:prior.score,details:parseDetails(prior)},note:'Previously qualifying window no longer has at least two consecutive usable hours.'});
+    changes++;
   }
   return changes;
 }
@@ -197,7 +239,7 @@ async function deliverPendingAlerts(env) {
   // Positive events are blocked until independent safety checks exist.
   // This avoids sending a misleading 'good to go' notification from forecast-only data.
   const rows = await env.DB.prepare(`SELECT id, event_type, details_json FROM tbl_alert_events
-    WHERE delivery_status='pending' AND event_type IN ('DETERIORATING','DETERIORATING_OR_CANCELLED')
+    WHERE delivery_status='pending' AND event_type IN ('DETERIORATING','CANCELLED')
     ORDER BY id ASC LIMIT 20`).all();
   let sent = 0;
   for (const row of rows.results) {
@@ -302,7 +344,7 @@ export default {
         if(!row) return json({error:'No stored forecast'},404);
         const data={weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json)};
         const windows=buildOpportunities(data,official,{'carrum-foreshore':carrumNotices,'patterson-river':pattersonNotices});
-        return json({checked_at:row.checked_at,horizon_hours:72,min_window_hours:2,availability:'Weekends daylight; Wed/Fri after 16:00; Mon/Tue/Thu after 17:00 Melbourne time',alerts_enabled:env.ALERTS_ENABLED==='true',windows});
+        return json({checked_at:row.checked_at,horizon_hours:72,min_window_hours:2,availability:'Weekends daylight; Wed/Fri after 16:00; Mon/Tue/Thu after 17:00 Melbourne time',alerts_enabled:env.ALERTS_ENABLED==='true',event_matching:'stable by site + activity + Melbourne local date; >=2h/10pt hysteresis',windows});
       }
       if (u.pathname === '/api/opportunities') {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
