@@ -386,16 +386,28 @@ function buildOpportunities(data, official, noticesBySite, tides=[], forecastChe
         if(!bomPeriodGroups.has(key)) bomPeriodGroups.set(key,{period,points:[]});
         bomPeriodGroups.get(key).points.push(x.point);
       }
-      const bomCrossChecks=[...bomPeriodGroups.values()].map(({period,points:matched})=>{
-        const range=(field,unit,digits)=>{
-          const vals=matched.map(p=>p[field]).filter(v=>typeof v==='number'&&Number.isFinite(v));
-          if(!vals.length) return 'unavailable';
-          const lo=Math.min(...vals).toFixed(digits),hi=Math.max(...vals).toFixed(digits);
-          return `${lo}${lo===hi?'':`–${hi}`} ${unit}`;
+      const bomComparisons=[...bomPeriodGroups.values()].map(({period,points:matched})=>{
+        const values=field=>matched.map(p=>Number(p[field])).filter(Number.isFinite);
+        const winds=values('wind'), waves=values('wave_m');
+        return {
+          period_start_at:period?.start_at||null,
+          period_end_at:period?.end_at||null,
+          bom_winds:period?.winds||null,
+          bom_seas:period?.seas||null,
+          bom_wind_upper_kn:bomUpperWindKn(period?.winds),
+          bom_seas_upper_m:bomUpperSeaM(period?.seas),
+          local_wind_min_kn:winds.length?+Math.min(...winds).toFixed(1):null,
+          local_wind_max_kn:winds.length?+Math.max(...winds).toFixed(1):null,
+          local_wave_min_m:waves.length?+Math.min(...waves).toFixed(2):null,
+          local_wave_max_m:waves.length?+Math.max(...waves).toFixed(2):null
         };
-        return `BOM Port Phillip local-waters forecast: winds ${period?.winds||'unavailable'} seas ${period?.seas||'unavailable'} Materially rougher than numerical model wind ${range('wind','kt',1)}, waves ${range('wave_m','m',2)}. Broad-area forecast, not a launch-site measurement.`;
       });
-      const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:bestDeparture,advisories,bom_cross_check:bomCrossChecks,
+      const bomCrossChecks=bomComparisons.map(x=>{
+        const localWind=x.local_wind_min_kn==null?'unavailable':`${x.local_wind_min_kn}${x.local_wind_max_kn===x.local_wind_min_kn?'':`–${x.local_wind_max_kn}`} kt`;
+        const localWave=x.local_wave_min_m==null?'unavailable':`${x.local_wave_min_m}${x.local_wave_max_m===x.local_wave_min_m?'':`–${x.local_wave_max_m}`} m`;
+        return `BOM Port Phillip local-waters forecast: winds ${x.bom_winds||'unavailable'} seas ${x.bom_seas||'unavailable'} Materially rougher than numerical model wind ${localWind}, waves ${localWave}. Broad-area forecast, not a launch-site measurement.`;
+      });
+      const details={classification:quality,duration_hours:hours(start,end),preferred_hours:preferredHours,marginal_hours:marginalHours,best_departure:bestDeparture,advisories,bom_cross_check:bomCrossChecks,bom_comparison:bomComparisons,
         mean_wind_kn:avg('wind'),peak_gust_kn:peak('gust'),max_wave_m:peak('wave_m'),mean_wave_period_s:avg('wave_period_s'),
         wind_direction_deg:avg('direction'),tide_reference:verifiedTideContext(bestDeparture,tides),hourly:run.map((x,i)=>({time:x.point.time,status:environmentalStatuses[i],assessment_status:x.assessment.status,tide:x.tide,cautions:[...(x.assessment.cautions||[]),...(x.bomCrossCheck?.reason?[x.bomCrossCheck.reason]:[])],blockers:x.assessment.blockers,bom_cross_check:x.bomCrossCheck?.material?{material:true,reason:x.bomCrossCheck.reason,winds:x.bomCrossCheck.period?.winds||null,seas:x.bomCrossCheck.period?.seas||null}:null})),
         arrival_checks:run[0].assessment.arrival_checks||[],return_buffer_minutes:RETURN_BUFFER_MINUTES,feasible_return_rule:'Window must end at least 30 minutes before forecast sunset',forecast_checked_at:forecastCheckedAt,launch_verified:false,official_checks_included:true};
