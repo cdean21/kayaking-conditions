@@ -72,7 +72,18 @@ def candidates_on_page(html):
     return found
 
 
-def classify_notice(text):
+def classify_notice(text, cancels):
+    # A notice that explicitly says the work/hazard is complete and cancels
+    # earlier notices is a resolution notice. Check this BEFORE hazard keywords:
+    # resolution notices often repeat words such as dredging/shoaling while
+    # describing the condition that has now ended.
+    resolved_language = re.search(
+        r'(?i)\b(?:completed|complete|concluded|finished|restored|reinstated|'
+        r'no longer in effect|cancelled|canceled)\b', text
+    )
+    if cancels and resolved_language:
+        return 'resolved'
+
     # Classification is deliberately conservative. Only explicit closure,
     # exclusion, depth/entrance or obstruction language becomes a hard block.
     if re.search(r'(?i)\b(?:closed|closure|prohibited|exclusion zone|do not enter|unsafe to navigate|shoal(?:ing)?|insufficient depth|reduced depth|dredg(?:ing|e)|obstruction|navigation hazard)\b', text):
@@ -129,7 +140,7 @@ def main():
             'cancels': cancels,
             'category': ('carrum' if re.search(r'\bCarrum\b', relevant_text, re.I) else 'patterson' if re.search(r'Patterson\s+River', relevant_text, re.I) else 'mordialloc' if re.search(r'\bMordialloc\b', relevant_text, re.I) else 'nearby'),
             'detail_verified': True,
-            'assessment': classify_notice(relevant_text),
+            'assessment': classify_notice(relevant_text, cancels),
             '_relevant': relevant,
         })
 
