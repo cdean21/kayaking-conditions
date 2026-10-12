@@ -1,4 +1,5 @@
-// Conservative automated launch checks. These are screening gates, never a declaration that it is safe to launch.
+// Automated launch screening. Preference bands help rank outings; hard gates remain conservative.
+// This module never declares a launch or on-water conditions safe.
 const FORECAST_MAX_AGE_MS = 6 * 3600000;
 const num = v => typeof v === 'number' && Number.isFinite(v) ? v : null;
 const angular = d => ((d % 360) + 360) % 360;
@@ -9,11 +10,45 @@ const offshoreSector = deg => {
   return d >= 45 && d <= 135;
 };
 
+// These are user preference / automated-screening bands, not universal safety limits.
+const PROFILES = {
+  fishing: {
+    wind:{preferredMax:10, hardMax:15},
+    gust:{preferredMax:15, hardMax:20},
+    wave:{preferredMax:0.4, hardMax:0.7}
+  },
+  kayaking: {
+    wind:{preferredMax:12, hardMax:15},
+    gust:{preferredMax:16, hardMax:20},
+    wave:{preferredMax:0.4, hardMax:0.7}
+  },
+  sailing: {
+    wind:{preferredMin:8, preferredMax:20, marginalMin:5, hardMax:24},
+    gust:{preferredMax:24, hardMax:28},
+    wave:{preferredMax:0.7, hardMax:1.0}
+  }
+};
+
+const describeBand = (label, value, unit, band, activity) => {
+  if (band === 'preferred') return `${label} ${value} ${unit} within preferred ${activity} range`;
+  if (band === 'marginal-low') return `${label} ${value} ${unit} below preferred ${activity} range`;
+  if (band === 'marginal') return `${label} ${value} ${unit} outside preferred ${activity} range`;
+  return `${label} ${value} ${unit} exceeds provisional ${activity} hard-block threshold`;
+};
+
+function upperBand(value, preferredMax, hardMax) {
+  if (value <= preferredMax) return 'preferred';
+  if (value <= hardMax) return 'marginal';
+  return 'blocked';
+}
+
 export function assessLaunch({site='carrum-foreshore', activity='fishing', official, notices, point, forecastCheckedAt, at}) {
   const blockers=[];
   const cautions=[];
   const passed=[];
   const missing=[];
+  const arrival_checks=[];
+  const profile=PROFILES[activity] || PROFILES.fishing;
 
   if (!official || official.stale || official.status === 'missing' || official.status === 'invalid') missing.push('Fresh validated BOM marine status');
   else if (official.status === 'warning_active' || official.positive_alert_gate === 'blocked') blockers.push('BOM marine warning gate is blocked');
@@ -44,13 +79,22 @@ export function assessLaunch({site='carrum-foreshore', activity='fishing', offic
     const wind=num(point.wind), gust=num(point.gust), wave=num(point.wave_m), direction=num(point.direction);
     if (wind===null || gust===null || wave===null) missing.push('Wind, gust and wave forecast values');
     else {
-      const limits = activity==='sailing' ? {windMin:8,windMax:20,gust:24,wave:.7} : activity==='kayaking' ? {windMin:0,windMax:12,gust:16,wave:.4} : {windMin:0,windMax:10,gust:16,wave:.4};
-      if (wind > limits.windMax) blockers.push(`Sustained wind ${wind.toFixed(1)} kn exceeds ${limits.windMax} kn ${activity} preference`);
-      else if (wind < limits.windMin) cautions.push(`Sustained wind ${wind.toFixed(1)} kn is below ${limits.windMin} kn sailing preference`);
-      else passed.push(`Sustained wind ${wind.toFixed(1)} kn within ${activity} preference`);
-      if (gust > limits.gust) blockers.push(`Gusts ${gust.toFixed(1)} kn exceed provisional ${limits.gust} kn limit`); else passed.push(`Gusts ${gust.toFixed(1)} kn within provisional limit`);
-      if (wave > limits.wave) blockers.push(`Modelled waves ${wave.toFixed(2)} m exceed provisional ${limits.wave.toFixed(1)} m limit`); else passed.push(`Modelled waves ${wave.toFixed(2)} m within provisional limit`);
-      if (offshoreSector(direction) && wind >= 12) blockers.push(`Strong offshore-component wind (${Math.round(direction)}° at ${wind.toFixed(1)} kn)`);
+      let windBand;
+      if (activity==='sailing' && wind < profile.wind.preferredMin) {
+        windBand=wind < profile.wind.marginalMin ? 'blocked' : 'marginal-low';
+      } else windBand=upperBand(wind,profile.wind.preferredMax,profile.wind.hardMax);
+      const gustBand=upperBand(gust,profile.gust.preferredMax,profile.gust.hardMax);
+      const waveBand=upperBand(wave,profile.wave.preferredMax,profile.wave.hardMax);
+
+      const windText=describeBand('Sustained wind',wind.toFixed(1),'kn',windBand,activity);
+      const gustText=describeBand('Gusts',gust.toFixed(1),'kn',gustBand,activity);
+      const waveText=describeBand('Modelled waves',wave.toFixed(2),'m',waveBand,activity);
+      (windBand==='blocked'?blockers:windBand==='preferred'?passed:cautions).push(windText);
+      (gustBand==='blocked'?blockers:gustBand==='preferred'?passed:cautions).push(gustText);
+      (waveBand==='blocked'?blockers:waveBand==='preferred'?passed:cautions).push(waveText);
+
+      // Offshore wind increases return-to-shore consequences. Treat strong offshore flow as a hard gate.
+      if (offshoreSector(direction) && wind >= 15) blockers.push(`Strong offshore-component wind (${Math.round(direction)}° at ${wind.toFixed(1)} kn)`);
       else if (offshoreSector(direction) && wind >= 8) cautions.push(`Offshore-component wind (${Math.round(direction)}° at ${wind.toFixed(1)} kn)`);
     }
     if ([95,96,99].includes(point.weather_code)) blockers.push('Thunderstorm weather code forecast');
@@ -58,21 +102,23 @@ export function assessLaunch({site='carrum-foreshore', activity='fishing', offic
     if (point.is_day === false) blockers.push('Outside daylight');
   }
 
-  const physicalCheck = site==='patterson-river'
+  arrival_checks.push(site==='patterson-river'
     ? 'Verify Patterson River entrance, breaking waves, current and actual depth on arrival.'
-    : 'Verify Carrum shore break, surf, wind and beach launch conditions on arrival.';
-  cautions.push(physicalCheck);
+    : 'Verify Carrum shore break, surf, wind and beach launch conditions on arrival.');
 
-  const status = missing.length ? 'incomplete' : blockers.length ? 'blocked' : cautions.length > 1 ? 'caution' : 'passed';
+  // A known hard blocker wins. Otherwise missing safety inputs fail closed as incomplete.
+  const status = blockers.length ? 'blocked' : missing.length ? 'incomplete' : cautions.length ? 'marginal' : 'preferred';
   const labels = {
     incomplete:'Launch checks incomplete',
     blocked:'Automated launch checks failed',
-    caution:'Automated checks pass with cautions',
-    passed:'Automated launch checks passed'
+    marginal:'Marginal / caution conditions',
+    preferred:'Preferred conditions'
   };
   return {
-    site, activity, at:at || point?.time || null, status, label:labels[status], automated_checks_passed:status==='passed'||status==='caution',
-    launch_verified:false, blockers, cautions, passed, missing,
-    note:'Automated screening only — not a declaration that conditions are safe. Verify actual conditions at the launch site and on the water.'
+    site, activity, at:at || point?.time || null, status, label:labels[status],
+    automated_checks_passed:status==='preferred'||status==='marginal', launch_verified:false,
+    blockers, cautions, passed, missing, arrival_checks,
+    thresholds:profile,
+    note:'Automated screening only — preference bands and provisional hard-block thresholds are not declarations that conditions are safe. Verify actual conditions at the launch site and on the water.'
   };
 }

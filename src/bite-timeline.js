@@ -68,13 +68,13 @@ export function buildBiteTimeline({weather,marine,checkedAt,tides=[],site='carru
     const weather={mean_wind_kn:p.wind,peak_gust_kn:p.gust,max_wave_m:p.wave_m,sea_surface_temp_c:p.sea_surface_temp_c};
     const scores=scoreSpecies(time,weather).map(s=>({ id:s.species_id,name:s.name,category:s.category,priority:s.priority,score:s.score,band:s.band,signals:s.signals }));
     const moon=lunarDetails(time);
-    const storm=[95,96,99].includes(p.weather_code);
-    const weatherGate=p.wind!==null&&p.gust!==null&&p.wave_m!==null&&p.wind<=10&&p.gust<=16&&p.wave_m<=0.4&&!storm;
+    const launchAssessment=launchContext?assessLaunch({site,activity:'fishing',official:launchContext.official,notices:launchContext.notices,point:p,forecastCheckedAt:checkedAt,at:time}):null;
+    const weatherGate=launchAssessment?.status==='preferred';
     hours.push({time,site,temperature_c:p.sea_surface_temp_c,temperature_source:p.sea_surface_temp_c===null?'unavailable':'Open-Meteo model, not observation',clarity:clarityEstimate(p),
       tide, moon:{phase:moon.phase,illumination_percent:moon.illumination_percent,moonrise:moon.moonrise?.utc||null,moonset:moon.moonset?.utc||null,overhead:moon.overhead?.utc||null,underfoot:moon.underfoot?.utc||null},
       confidence:confidence(p,ageHours,tide,completeness),species:scores,provisional_fishing_weather:weatherGate,
       conditions:{wind_kn:p.wind,gust_kn:p.gust,wave_m:p.wave_m,wind_direction_deg:p.direction,precipitation_mm:p.precipitation,weather_code:p.weather_code,is_day:p.is_day},
-      launch_assessment:launchContext?assessLaunch({site,activity:'fishing',official:launchContext.official,notices:launchContext.notices,point:p,forecastCheckedAt:checkedAt,at:time}):null,
+      launch_assessment:launchAssessment,
       launch_status:'unverified', warning:'Do not treat a high bite score as launch clearance.' });
   }
   return {site,checked_at:checkedAt,generated_at:now,hours,source:'Stored Open-Meteo weather/marine forecast + approximate SunCalc astronomy + verified BOM Williamstown reference tides if imported',
