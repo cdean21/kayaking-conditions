@@ -117,7 +117,7 @@ def main():
             'title': label or number,
             'url': url,
             'cancels': cancels,
-            'category': 'patterson' if re.search(r'Patterson\s+River', relevant_text, re.I) else 'nearby',
+            'category': ('carrum' if re.search(r'\bCarrum\b', relevant_text, re.I) else 'patterson' if re.search(r'Patterson\s+River', relevant_text, re.I) else 'mordialloc' if re.search(r'\bMordialloc\b', relevant_text, re.I) else 'nearby'),
             'detail_verified': True,
             '_relevant': relevant,
         })

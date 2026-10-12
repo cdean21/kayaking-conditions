@@ -6,7 +6,7 @@ export function validateNoticePayload(body) {
   if (!Number.isFinite(Date.parse(body.fetched_at)) || Math.abs(Date.now()-Date.parse(body.fetched_at))>15*60000) throw Error('Invalid notice fetch timestamp');
   const notices=body.notices.map(n=>{
     if(!n || !/^\d{1,4}(?:\(T\))?-20\d\d$/.test(n.number) || typeof n.title!=='string' || !n.title.trim() || n.title.length>300 || typeof n.url!=='string' || !n.url.startsWith('https://www.parks.vic.gov.au/mariners-notices/') || !Array.isArray(n.cancels) || n.cancels.length>30 || n.cancels.some(c=>!/^\d{1,4}(?:\(T\))?-20\d\d$/.test(c))) throw Error('Invalid notice item');
-    return {number:n.number,title:n.title.trim(),url:n.url,cancels:n.cancels,category:n.category==='patterson'?'patterson':'nearby',temporary:n.number.includes('(T)'),detail_verified:n.detail_verified===true};
+    return {number:n.number,title:n.title.trim(),url:n.url,cancels:n.cancels,category:['patterson','carrum','mordialloc','nearby'].includes(n.category)?n.category:'nearby',temporary:n.number.includes('(T)'),detail_verified:n.detail_verified===true};
   });
   if(new Set(notices.map(n=>n.number)).size!==notices.length) throw Error('Duplicate notices');
   return {source:NOTICES_SOURCE,coverage:'recent_listing',fetched_at:new Date(body.fetched_at).toISOString(),notices};
@@ -16,7 +16,7 @@ export function assessNotices(snapshot,site='patterson-river') {
   if(Date.now()-Date.parse(snapshot.fetched_at)>MAX_AGE_MS) return {status:'stale',label:'Local notices out of date',launch_verified:false,checked_at:snapshot.fetched_at};
   const notices=snapshot.notices||[];
   const cancelled=new Set(notices.flatMap(n=>n.cancels));
-  const relevant=notices.filter(n=>!cancelled.has(n.number) && (site==='patterson-river'?n.category==='patterson':n.category==='nearby'));
+  const relevant=notices.filter(n=>!cancelled.has(n.number) && (site==='patterson-river'?n.category==='patterson':['carrum','nearby'].includes(n.category)));
   const unresolved=relevant.filter(n=>n.temporary || !n.detail_verified);
   return {status:unresolved.length?'review_required':'no_unresolved_in_recent_listing',label:unresolved.length?'Review local navigation notices':'No unresolved notices in recent listing',launch_verified:false,checked_at:snapshot.fetched_at,coverage:snapshot.coverage,notices:relevant,unresolved_count:unresolved.length,note:'A recent notice listing cannot verify all extant notices, physical entrance depth, wave breaking, currents or on-water launch conditions.'};
 }

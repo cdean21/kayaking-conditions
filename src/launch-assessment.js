@@ -21,7 +21,10 @@ export function assessLaunch({site='carrum-foreshore', activity='fishing', offic
   else missing.push('Verified Port Phillip warning state');
 
   if (!notices || ['unavailable','stale'].includes(notices.status)) missing.push('Fresh Parks Victoria local notice check');
-  else if (notices.status === 'review_required' || (notices.unresolved_count || 0) > 0) blockers.push('Local navigation notice requires review');
+  else if (notices.status === 'review_required' || (notices.unresolved_count || 0) > 0) {
+    const ids=(notices.notices || []).filter(n=>n.temporary || !n.detail_verified).map(n=>n.number);
+    blockers.push(`Local navigation notice requires review${ids.length ? ': ' + ids.join(', ') : ''} (not necessarily a launch closure)`);
+  }
   else if (notices.status === 'no_unresolved_in_recent_listing') passed.push('No unresolved local notice found in recent Parks Victoria listing');
   else missing.push('Resolved local notice state');
 
