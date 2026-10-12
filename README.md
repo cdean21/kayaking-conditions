@@ -203,3 +203,6 @@ completeness, quality or reliability, and excludes liability for loss arising
 from use of or reliance on the information, to the extent permitted by law.
 See the complete official conditions of use at
 https://www.bom.gov.au/oceanography/projects/ntc/vic_tide_tables.shtml .
+
+## Automated launch screening
+`GET /api/launch-assessment?site=carrum-foreshore&activity=fishing` combines the latest validated BOM Port Phillip warning snapshot, Parks Victoria local-notice snapshot, and the nearest stored local weather/marine forecast hour. It returns `passed`, `caution`, `blocked`, or `incomplete`. `launch_verified` deliberately remains false: actual shore break/river entrance state, currents and rapidly changing on-water conditions must still be checked at the site. Positive alerts remain blocked while `ALERTS_ENABLED=false`.

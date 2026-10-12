@@ -1,5 +1,6 @@
 import { scoreSpecies } from './fishing.js';
 import { lunarDetails } from './lunar.js';
+import { assessLaunch } from './launch-assessment.js';
 const SITES = ['carrum-foreshore','patterson-river'];
 const clamp = (n,a=0,b=100) => Math.max(a,Math.min(b,n));
 const asIso = s => typeof s==='string' && Number.isFinite(Date.parse(s)) ? new Date(s).toISOString() : null;
@@ -44,7 +45,7 @@ function confidence(p, ageHours, tide, completeness) {
   score=clamp(score,0,75); // Unverified official warnings/entrance status cap confidence.
   return { score, level:score>=65?'moderate':score>=45?'low':'very low', label:'Data confidence only; not safety confidence', limitations:['Official marine warnings not automatically verified','Patterson River entrance conditions not verified','No observed water clarity','Coastal model uncertainty'] };
 }
-export function buildBiteTimeline({weather,marine,checkedAt,tides=[],site='carrum-foreshore',now=new Date().toISOString(),limit=72}) {
+export function buildBiteTimeline({weather,marine,checkedAt,tides=[],site='carrum-foreshore',now=new Date().toISOString(),limit=72,launchContext=null}) {
   if(!SITES.includes(site)) throw new Error('Unknown site');
   const weatherItem=Array.isArray(weather)?weather.find(w=>w.site===site):null;
   if (!weatherItem?.data?.hourly || !marine?.hourly) return { site, hours:[], status:'missing_forecast' };
@@ -61,7 +62,7 @@ export function buildBiteTimeline({weather,marine,checkedAt,tides=[],site='carru
     const marinePoint=waves.get(time)||{};
     const p={ time, wind:number(wh.wind_speed_10m?.[i]),gust:number(wh.wind_gusts_10m?.[i]),
       precipitation:number(wh.precipitation?.[i]), weather_code:wh.weather_code?.[i]??null,
-      ...marinePoint };
+      direction:number(wh.wind_direction_10m?.[i]), is_day:wh.is_day?.[i]===1, ...marinePoint };
     const tide=findTide(time,tides);
     const completeness=[p.wind,p.gust,p.wave_m,p.precipitation,p.sea_surface_temp_c].filter(v=>v!==null&&v!==undefined).length/5;
     const weather={mean_wind_kn:p.wind,peak_gust_kn:p.gust,max_wave_m:p.wave_m,sea_surface_temp_c:p.sea_surface_temp_c};
@@ -72,6 +73,8 @@ export function buildBiteTimeline({weather,marine,checkedAt,tides=[],site='carru
     hours.push({time,site,temperature_c:p.sea_surface_temp_c,temperature_source:p.sea_surface_temp_c===null?'unavailable':'Open-Meteo model, not observation',clarity:clarityEstimate(p),
       tide, moon:{phase:moon.phase,illumination_percent:moon.illumination_percent,moonrise:moon.moonrise?.utc||null,moonset:moon.moonset?.utc||null,overhead:moon.overhead?.utc||null,underfoot:moon.underfoot?.utc||null},
       confidence:confidence(p,ageHours,tide,completeness),species:scores,provisional_fishing_weather:weatherGate,
+      conditions:{wind_kn:p.wind,gust_kn:p.gust,wave_m:p.wave_m,wind_direction_deg:p.direction,precipitation_mm:p.precipitation,weather_code:p.weather_code,is_day:p.is_day},
+      launch_assessment:launchContext?assessLaunch({site,activity:'fishing',official:launchContext.official,notices:launchContext.notices,point:p,forecastCheckedAt:checkedAt,at:time}):null,
       launch_status:'unverified', warning:'Do not treat a high bite score as launch clearance.' });
   }
   return {site,checked_at:checkedAt,generated_at:now,hours,source:'Stored Open-Meteo weather/marine forecast + approximate SunCalc astronomy + verified BOM Williamstown reference tides if imported',

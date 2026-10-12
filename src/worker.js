@@ -1,4 +1,5 @@
 import { readLocalNotices, validateNoticePayload } from './local-notices.js';
+import { assessLaunch } from './launch-assessment.js';
 import { buildOfficialMarineSnapshot, BOM_MARINE_WARNINGS, validateTideEvents } from './official-marine.js';
 import { buildBiteTimeline } from './bite-timeline.js';
 import { lunarDetails } from './lunar.js';
@@ -227,6 +228,28 @@ async function readOfficialMarineSnapshot(env) {
   return { ...details, checked_at:row.checked_at, snapshot_age_minutes:Number.isFinite(ageMs)?Math.max(0,Math.round(ageMs/60000)):null, stale, positive_alert_gate:stale?'blocked':(details.positive_alert_gate || 'blocked') };
 }
 
+function forecastPointForSite(row, site, at=new Date().toISOString()) {
+  if (!row) return null;
+  const weather=JSON.parse(row.weather_json||'[]');
+  const marine=JSON.parse(row.marine_json||'{}');
+  const w=weather.find(x=>x.site===site)?.data?.hourly;
+  const mh=marine?.hourly;
+  if(!w?.time?.length || !mh?.time?.length) return null;
+  const target=Date.parse(at);
+  let wi=0,best=Infinity;
+  w.time.forEach((t,i)=>{const d=Math.abs(Date.parse(t+'Z')-target);if(d<best){best=d;wi=i}});
+  const mt=w.time[wi], mi=mh.time.indexOf(mt);
+  return {time:mt+'Z',wind:w.wind_speed_10m?.[wi]??null,gust:w.wind_gusts_10m?.[wi]??null,direction:w.wind_direction_10m?.[wi]??null,precipitation:w.precipitation?.[wi]??null,weather_code:w.weather_code?.[wi]??null,is_day:w.is_day?.[wi]===1,wave_m:mi>=0?(mh.wave_height?.[mi]??null):null};
+}
+async function currentLaunchAssessment(env, site='carrum-foreshore', activity='fishing', at=new Date().toISOString()) {
+  const [official,notices,row]=await Promise.all([
+    readOfficialMarineSnapshot(env), readLocalNotices(env,site),
+    env.DB.prepare("SELECT checked_at,weather_json,marine_json FROM tbl_forecast_runs WHERE status='ok' ORDER BY id DESC LIMIT 1").first()
+  ]);
+  const point=forecastPointForSite(row,site,at);
+  return assessLaunch({site,activity,official,notices,point,forecastCheckedAt:row?.checked_at,at});
+}
+
 async function run(env) {
   try {
     const official = await readOfficialMarineSnapshot(env);
@@ -254,6 +277,15 @@ export default {
       if (u.pathname === '/api/opportunities') {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
         return json({ safety_verified:false, opportunities:rows.results.map(x=>({ ...x, details:JSON.parse(x.details_json), details_json:undefined })) });
+      }
+      if (u.pathname === '/api/launch-assessment' && request.method === 'GET') {
+        const site=u.searchParams.get('site')||'carrum-foreshore';
+        const activity=u.searchParams.get('activity')||'fishing';
+        const at=u.searchParams.get('at')||stamp();
+        if (!SITES.some(s=>s.id===site)) return json({error:'Unknown site'},400);
+        if (!ACTIVITIES.some(a=>a.id===activity)) return json({error:'Unknown activity'},400);
+        if (!Number.isFinite(Date.parse(at))) return json({error:'Invalid at timestamp'},400);
+        return json(await currentLaunchAssessment(env,site,activity,at));
       }
       if (u.pathname === '/api/local/notices' && request.method === 'GET') {
         const site=u.searchParams.get('site')||'patterson-river';
@@ -301,7 +333,8 @@ export default {
         const tideStart=new Date(Date.now()-12*3600000).toISOString();
         const tideEnd=new Date(Date.now()+84*3600000).toISOString();
         const tides=await env.DB.prepare("SELECT reference_station,event_at,event_type,height_m,datum,source_name FROM tbl_verified_tides WHERE datetime(event_at) >= datetime(?) AND datetime(event_at) <= datetime(?) ORDER BY datetime(event_at) LIMIT 100").bind(tideStart,tideEnd).all();
-        return json(buildBiteTimeline({weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json),checkedAt:row.checked_at,tides:tides.results,site}));
+        const [official,notices]=await Promise.all([readOfficialMarineSnapshot(env),readLocalNotices(env,site)]);
+        return json(buildBiteTimeline({weather:JSON.parse(row.weather_json),marine:JSON.parse(row.marine_json),checkedAt:row.checked_at,tides:tides.results,site,launchContext:{official,notices}}));
       }
       if (u.pathname === '/api/fishing/outlook') {
         const rows = await env.DB.prepare("SELECT * FROM tbl_opportunities WHERE activity='fishing' AND status='candidate' AND ends_at > ? ORDER BY starts_at ASC LIMIT 100").bind(stamp()).all();
@@ -314,7 +347,8 @@ export default {
       }
       if (u.pathname === '/api/status') {
         const row = await env.DB.prepare('SELECT id,checked_at,status,error FROM tbl_forecast_runs ORDER BY id DESC LIMIT 1').first();
-        return json({ latest_run:row, official_marine_external_ingest:true,official_port_phillip_forecast_integrated:true,official_safety_feeds_integrated:false, notifications_integrated:true, notifications_enabled:env.ALERTS_ENABLED === 'true', positive_alerts_blocked:true });
+        const [official,notices]=await Promise.all([readOfficialMarineSnapshot(env),readLocalNotices(env,'patterson-river')]);
+        return json({ latest_run:row, official_marine_external_ingest:true,official_port_phillip_forecast_integrated:true,local_notices_integrated:true,official_safety_feeds_integrated:official.status==='verified_no_port_phillip_warning'&&notices.status==='no_unresolved_in_recent_listing', notifications_integrated:true, notifications_enabled:env.ALERTS_ENABLED === 'true', positive_alerts_blocked:true });
       }
       if (u.pathname === '/api/pushover/test' && request.method === 'POST') {
         if (!await auth(request,env)) return json({ error:'Unauthorized' },401);
