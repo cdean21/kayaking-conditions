@@ -81,7 +81,14 @@ def classify_notice(text, cancels):
         r'(?i)\b(?:completed|complete|concluded|finished|restored|reinstated|'
         r'no longer in effect|cancelled|canceled)\b', text
     )
-    if cancels and resolved_language:
+    # Notice 394-2026: the submerged car was removed and 388(T)-2026
+    # explicitly cancelled. 'Removed' describes resolution of that particular
+    # obstruction, not a new hazard. Do not generalise to every supersession.
+    obstruction_removed = re.search(
+        r'(?i)\b(?:submerged\s+car|submerged\s+vehicle)\b.{0,180}\bremoved\b',
+        text
+    )
+    if cancels and (resolved_language or obstruction_removed):
         return 'resolved'
 
     # Classification is deliberately conservative. Only explicit closure,
