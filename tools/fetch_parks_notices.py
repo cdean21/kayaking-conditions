@@ -1,68 +1,149 @@
 #!/usr/bin/env python3
-"""Ingest a RECENT listing of Parks Victoria notices. Never treat as complete extant-notice register."""
-import os,re,json,datetime,urllib.request,urllib.parse
+"""Fetch recent Parks Victoria NTMs. Recent pages are NOT a complete active-notice register."""
+import datetime
+import json
+import os
+import re
+import urllib.parse
+import urllib.request
 from html.parser import HTMLParser
 
-ROOT='https://www.parks.vic.gov.au'
-LIST=ROOT+'/mariners-notices'
-WORKER=os.environ.get('WORKER_URL','https://kayaking-conditions.delicate-meadow-3eb1.workers.dev').rstrip('/')
-NUMBER=re.compile(r'(?i)\b(?:No\.?\s*)?(\d{1,4})\s*(\(T\))?\s*[-– ]\s*(20\d\d)\b')
-PATH=re.compile(r'^/mariners-notices/20\d\d/\d\d/\d\d/')
+ROOT = 'https://www.parks.vic.gov.au'
+LIST = ROOT + '/mariners-notices'
+WORKER = os.environ.get('WORKER_URL', 'https://kayaking-conditions.delicate-meadow-3eb1.workers.dev').rstrip('/')
+PATH = re.compile(r'^/mariners-notices/20\d\d/\d\d/\d\d/', re.I)
+NUMBER = re.compile(r'(?i)\b(?:No\.?\s*)?(\d{1,4})\s*(\(T\))?\s*[-– ]\s*(20\d{2}|\d{2})\b')
+LOCAL = re.compile(r'\b(?:Patterson\s+River|Carrum(?:\s+(?:Foreshore|Beach|Creek))?|Mordialloc(?:\s+Creek)?)\b', re.I)
 
 class Links(HTMLParser):
- def __init__(self):super().__init__();self.href=None;self.buf=[];self.items=[]
- def handle_starttag(self,tag,attrs):
-  if tag=='a':self.href=dict(attrs).get('href');self.buf=[]
- def handle_data(self,data):
-  if self.href is not None:self.buf.append(data)
- def handle_endtag(self,tag):
-  if tag=='a' and self.href is not None:self.items.append((self.href,' '.join(''.join(self.buf).split())));self.href=None
+    def __init__(self):
+        super().__init__()
+        self.href = None
+        self.buf = []
+        self.items = []
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            self.href = dict(attrs).get('href')
+            self.buf = []
+    def handle_data(self, data):
+        if self.href is not None:
+            self.buf.append(data)
+    def handle_endtag(self, tag):
+        if tag == 'a' and self.href is not None:
+            self.items.append((self.href, ' '.join(''.join(self.buf).split())))
+            self.href = None
 
 def fetch(url):
- req=urllib.request.Request(url,headers={'User-Agent':'kayaking-conditions-notice-ingest/1.0','Accept':'text/html'})
- with urllib.request.urlopen(req,timeout=25) as r:
-  if r.status!=200:raise RuntimeError(f'HTTP {r.status}: {url}')
-  return r.read(2_000_000).decode('utf-8','replace')
+    request = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (compatible; kayaking-conditions-notice-ingest/1.1)',
+        'Accept': 'text/html',
+    })
+    with urllib.request.urlopen(request, timeout=30) as response:
+        if response.status != 200:
+            raise RuntimeError(f'HTTP {response.status}: {url}')
+        return response.read(2_000_000).decode('utf-8', 'replace')
 
-def normalise(s):
- m=NUMBER.search(s)
- return f'{int(m.group(1)):03d}{"(T)" if m.group(2) else ""}-{m.group(3)}' if m else None
+def normalise(value):
+    match = NUMBER.search(value)
+    if not match:
+        return None
+    year = match.group(3)
+    if len(year) == 2:
+        year = '20' + year
+    return f'{int(match.group(1)):03d}{"(T)" if match.group(2) else ""}-{year}'
+
+def text_from_html(html):
+    html = re.sub(r'(?is)<(?:script|style)\b[^>]*>.*?</(?:script|style)>', ' ', html)
+    html = re.sub(r'(?s)<[^>]*>', ' ', html)
+    return ' '.join(__import__('html').unescape(html).split())
+
+def candidates_on_page(html):
+    parser = Links()
+    parser.feed(html)
+    found = {}
+    for href, label in parser.items:
+        url = urllib.parse.urljoin(ROOT, href)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.netloc not in ('parks.vic.gov.au', 'www.parks.vic.gov.au') or not PATH.match(parsed.path):
+            continue
+        number = normalise(label + ' ' + parsed.path.split('/')[-1].replace('-', ' '))
+        if number:
+            found[number] = (url, label)
+    return found
 
 def main():
- token=os.environ.get('BOM_INGEST_TOKEN')
- if not token:raise RuntimeError('Missing BOM_INGEST_TOKEN GitHub secret')
- links=Links();links.feed(fetch(LIST))
- candidates={}
- for href,label in links.items:
-  url=urllib.parse.urljoin(ROOT,href)
-  parsed=urllib.parse.urlparse(url)
-  if parsed.netloc not in ('www.parks.vic.gov.au','parks.vic.gov.au') or not PATH.match(parsed.path):continue
-  number=normalise(label+' '+parsed.path.split('/')[-1].replace('-',' '))
-  if number:candidates[number]=(url,label)
- if len(candidates)<10:raise RuntimeError('Parks listing unexpectedly short; refusing to ingest incomplete snapshot')
- # Recent listing only: inspect titles and cancellation text for Patterson River and nearby Carrum waters.
- selected={k:v for k,v in candidates.items() if re.search(r'patterson|carrum|mordialloc|port phillip|beaumaris',v[1],re.I)}
- # Cancellation notices may have unrelated titles, so fetch all recent detail pages (bounded).
- if len(candidates)>120:raise RuntimeError('Unexpectedly large listing; review pagination before ingest')
- items=[]
- for number,(url,title) in candidates.items():
-  html=fetch(url)
-  plain=re.sub(r'<[^>]+>',' ',html)
-  plain=re.sub(r'\s+',' ',plain)
-  relevant=number in selected or bool(re.search(r'Patterson River|Carrum Foreshore|Carrum Beach|Mordialloc Creek',title,re.I))
-  # Only inspect cancellation references in the labelled Previous notice section.
-  m=re.search(r'Previous\s+notice\s*:?(.{0,450}?)(?:Charts\s*&|Further\s+Notice|Details\s*:|Attachments\s*:)',plain,re.I)
-  cancels=[]
-  if m:
-   section=m.group(1)
-   if re.search(r'cancelled|canceled',section,re.I):cancels=list(dict.fromkeys(filter(None,(normalise(x.group(0)) for x in NUMBER.finditer(section)))))
-  # Also include notices that cancel an already relevant notice.
-  items.append(dict(number=number,title=title or number,url=url,cancels=cancels,category='patterson' if re.search(r'patterson river',title,re.I) else 'nearby',detail_verified=True,include=relevant))
- relevant_numbers={x['number'] for x in items if x['include']}
- relevant_items=[{k:v for k,v in x.items() if k!='include'} for x in items if x['include'] or any(c in relevant_numbers for c in x['cancels'])]
- if not relevant_items:raise RuntimeError('No local notices discovered; refuse silent clear')
- body=json.dumps(dict(source=LIST,coverage='recent_listing',fetched_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),notices=relevant_items)).encode()
- req=urllib.request.Request(WORKER+'/api/local/notices/ingest',data=body,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json','User-Agent':'kayaking-conditions-notice-ingest/1.0'},method='POST')
- with urllib.request.urlopen(req,timeout=30) as r:print(r.read().decode())
+    token = os.environ.get('BOM_INGEST_TOKEN')
+    if not token:
+        raise RuntimeError('Missing BOM_INGEST_TOKEN GitHub secret')
 
-if __name__=='__main__':main()
+    # The official site paginates ten notices at a time. Read several pages so
+    # relevant local notices are not hidden behind unrelated recent notices.
+    candidates = {}
+    for page in range(1, 9):
+        url = LIST + '?' + urllib.parse.urlencode({'page': page, 'pageSize': 10})
+        found = candidates_on_page(fetch(url))
+        if not found:
+            if page == 1:
+                raise RuntimeError('Parks listing contains no parseable notice links')
+            break
+        before = len(candidates)
+        candidates.update(found)
+        if len(candidates) == before:
+            break
+    if len(candidates) < 20:
+        raise RuntimeError(f'Only {len(candidates)} notice links found; refusing incomplete snapshot')
+    print(f'Discovered {len(candidates)} recent notices across paginated listing', flush=True)
+
+    items = []
+    for number, (url, label) in candidates.items():
+        plain = text_from_html(fetch(url))
+        # The listing's anchor label is just "No. 457 - 2026". The subject and
+        # locality are on the detail page, so inspect the detail content.
+        match = re.search(r'(?i)\bDetails\s*:', plain)
+        before_details = plain[:match.start()] if match else plain
+        # Include the notice's subject, location and details, but avoid footer
+        # text and unrelated navigation links.
+        end = re.search(r'(?i)\b(?:Previous\s+notice|Charts\s*&|Further\s+Notice|Attachments)\s*:', plain)
+        relevant_text = plain[:end.start()] if end else plain[:2500]
+        relevant = bool(LOCAL.search(relevant_text))
+        previous = re.search(r'(?i)\bPrevious\s+notice\s*:\s*(.*?)(?=\b(?:Charts\s*&|Further\s+Notice|Attachments)\s*:|$)', plain)
+        cancels = []
+        if previous and re.search(r'cancelled|canceled', previous.group(1), re.I):
+            cancels = list(dict.fromkeys(filter(None, (normalise(m.group(0)) for m in NUMBER.finditer(previous.group(1))))))
+        # Preserve the actual notice identifier and URL. Do not infer an active
+        # status or clear launch suitability from this limited recent listing.
+        items.append({
+            'number': number,
+            'title': label or number,
+            'url': url,
+            'cancels': cancels,
+            'category': 'patterson' if re.search(r'Patterson\s+River', relevant_text, re.I) else 'nearby',
+            'detail_verified': True,
+            '_relevant': relevant,
+        })
+
+    relevant_numbers = {x['number'] for x in items if x['_relevant']}
+    selected = [{k: v for k, v in x.items() if k != '_relevant'} for x in items
+                if x['_relevant'] or any(c in relevant_numbers for c in x['cancels'])]
+    print(f'Found {len(selected)} relevant local/cancellation notices', flush=True)
+    if not selected:
+        raise RuntimeError('No local notices discovered; refuse silent clear')
+    payload = json.dumps({
+        'source': LIST,
+        'coverage': 'recent_listing',
+        'fetched_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'notices': selected,
+    }).encode()
+    request = urllib.request.Request(
+        WORKER + '/api/local/notices/ingest', data=payload, method='POST',
+        headers={
+            'Authorization': 'Bearer ' + token,
+            'Content-Type': 'application/json',
+            'User-Agent': 'kayaking-conditions-notice-ingest/1.1',
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        print(response.read().decode())
+
+if __name__ == '__main__':
+    main()
