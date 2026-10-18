@@ -2,63 +2,71 @@
 import ftplib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 HOST = 'ftp.bom.gov.au'
 DIR = '/anon/gen/fwo'
-FILES = ('IDV20600.xml', 'IDV10460.xml')
+WARNING_FILE = 'IDV20600.xml'
+FORECAST_FILE = 'IDV10460.xml'
+WARNINGS_URL = 'https://www.bom.gov.au/marine/marine_warnings.shtml'
 WORKER_URL = 'https://kayaking-conditions.delicate-meadow-3eb1.workers.dev/api/bom/ingest'
-FTP_TIMEOUT = 25
-HTTP_TIMEOUT = 25
-MAX_ATTEMPTS = 3
 RETRY_DELAYS = (10, 30)
+USER_AGENT = 'kayaking-conditions-bom-ingest/1.1'
 
 token = os.environ.get('BOM_INGEST_TOKEN')
 if not token:
     raise SystemExit('BOM_INGEST_TOKEN is not set')
 
 
+def retrieve(ftp, name):
+    chunks = []
+    ftp.retrbinary('RETR ' + name, chunks.append)
+    raw = b''.join(chunks)
+    if not raw.strip():
+        raise RuntimeError(f'{name}: downloaded file is empty')
+    return raw.decode('utf-8')
+
+
 def download_products():
-    """Download a complete BOM product set or fail closed.
-
-    A fresh FTP connection is used for every attempt. This protects against
-    transient 550/open-file failures while BOM rotates forecast products.
-    Nothing is uploaded unless every required product is present and non-empty.
-    """
+    """Forecast is mandatory. A 550 for the conditional warning product is handled separately."""
     last_error = None
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, 4):
         ftp = None
-        products = {}
         try:
-            print(f'BOM FTP attempt {attempt}/{MAX_ATTEMPTS}: connecting to {HOST}...', flush=True)
-            ftp = ftplib.FTP(HOST, timeout=FTP_TIMEOUT)
+            print(f'BOM FTP attempt {attempt}/3: connecting to {HOST}...')
+            ftp = ftplib.FTP(HOST, timeout=25)
             ftp.login()
             ftp.cwd(DIR)
 
-            for name in FILES:
-                print(f'Downloading {name}...', flush=True)
-                chunks = []
-                ftp.retrbinary('RETR ' + name, chunks.append)
-                raw = b''.join(chunks)
-                if not raw.strip():
-                    raise RuntimeError(f'{name} downloaded successfully but was empty')
-                products[name] = raw.decode('utf-8')
-                print(f'Downloading {name}... OK ({len(raw):,} bytes)', flush=True)
+            warning_xml = None
+            warning_missing = False
+            print(f'Downloading {WARNING_FILE}...')
+            try:
+                warning_xml = retrieve(ftp, WARNING_FILE)
+                print(f'Downloading {WARNING_FILE}... OK')
+            except ftplib.error_perm as exc:
+                if str(exc).startswith('550'):
+                    warning_missing = True
+                    print(f'{WARNING_FILE} is not currently published (FTP 550).')
+                else:
+                    raise
 
-            return products
-
+            print(f'Downloading {FORECAST_FILE}...')
+            forecast_xml = retrieve(ftp, FORECAST_FILE)
+            print(f'Downloading {FORECAST_FILE}... OK')
+            return warning_xml, warning_missing, forecast_xml
         except ftplib.all_errors + (OSError, UnicodeDecodeError, RuntimeError) as exc:
             last_error = exc
-            print(
-                f'BOM FTP attempt {attempt}/{MAX_ATTEMPTS} failed: '
-                f'{type(exc).__name__}: {exc}',
-                file=sys.stderr,
-                flush=True,
-            )
+            print(f'BOM FTP attempt {attempt}/3 failed: {type(exc).__name__}: {exc}', file=sys.stderr)
+            if attempt < 3:
+                delay = RETRY_DELAYS[attempt - 1]
+                print(f'Retrying complete BOM product download in {delay} seconds...', file=sys.stderr)
+                time.sleep(delay)
         finally:
             if ftp is not None:
                 try:
@@ -69,27 +77,49 @@ def download_products():
                     except Exception:
                         pass
 
-        if attempt < MAX_ATTEMPTS:
-            delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
-            print(f'Retrying complete BOM product download in {delay} seconds...', flush=True)
-            time.sleep(delay)
-
-    raise RuntimeError(
-        f'Could not download a complete BOM product set after {MAX_ATTEMPTS} attempts; '
-        f'last error: {last_error}'
-    )
+    raise RuntimeError(f'Could not download the mandatory BOM product set after 3 attempts; last error: {last_error}')
 
 
-def upload_products(products):
-    missing = [name for name in FILES if not products.get(name)]
-    if missing:
-        raise RuntimeError('Refusing to ingest incomplete BOM product set: ' + ', '.join(missing))
+def verify_no_victorian_marine_warning():
+    """Use BOM's official Marine Warnings page as independent evidence when IDV20600 is absent."""
+    req = urllib.request.Request(WARNINGS_URL, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(req, timeout=25) as response:
+        if response.status != 200:
+            raise RuntimeError(f'BOM warnings page returned HTTP {response.status}')
+        html = response.read().decode('utf-8', errors='replace')
+
+    # Bound the check to the Victoria section so another state's "No warnings" cannot satisfy it.
+    match = re.search(r'Victoria(?P<section>[\s\S]{0,5000}?)(?:Queensland|Western Australia|South Australia|Tasmania|Northern Territory)', html, re.I)
+    if not match:
+        raise RuntimeError('Could not identify the Victoria section on the BOM Marine Warnings page')
+    section = re.sub(r'<[^>]+>', ' ', match.group('section'))
+    section = re.sub(r'\s+', ' ', section).strip()
+    if not re.search(r'No\s+Marine\s+Warnings\s+Current', section, re.I):
+        raise RuntimeError('IDV20600 is absent, but BOM does not explicitly report "No Marine Warnings Current" for Victoria')
+
+    checked_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    print('BOM Marine Warnings page confirms: Victoria — No Marine Warnings Current.')
+    return {
+        'status': 'verified_no_current_victorian_marine_warning',
+        'state': 'Victoria',
+        'checked_at': checked_at,
+        'source_url': WARNINGS_URL,
+        'source': 'Bureau of Meteorology Marine Warnings page'
+    }
+
+
+def main():
+    warning_xml, warning_missing, forecast_xml = download_products()
+    warning_evidence = None
+    if warning_missing:
+        # Missing IDV20600 is only accepted after a second official BOM source explicitly confirms no VIC warning.
+        warning_evidence = verify_no_victorian_marine_warning()
 
     payload = json.dumps({
-        'warning_xml': products['IDV20600.xml'],
-        'forecast_xml': products['IDV10460.xml'],
+        'warning_xml': warning_xml,
+        'warning_evidence': warning_evidence,
+        'forecast_xml': forecast_xml
     }).encode()
-
     req = urllib.request.Request(
         WORKER_URL,
         data=payload,
@@ -97,31 +127,24 @@ def upload_products(products):
         headers={
             'Authorization': 'Bearer ' + token,
             'Content-Type': 'application/json',
-            'User-Agent': 'kayaking-conditions-bom-ingest/1.1',
-        },
+            'User-Agent': USER_AGENT
+        }
     )
-
-    print('Uploading complete BOM product set to kayaking-conditions...', flush=True)
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+        with urllib.request.urlopen(req, timeout=25) as response:
             body = response.read().decode()
             print(body)
             if response.status < 200 or response.status >= 300:
-                raise RuntimeError(f'Worker returned HTTP {response.status}')
+                raise SystemExit(1)
     except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode('utf-8', errors='replace')
-        except Exception:
-            body = ''
-        raise RuntimeError(
-            f'Worker ingest returned HTTP {exc.code}' + (f': {body}' if body else '')
-        ) from exc
+        body = exc.read().decode('utf-8', errors='replace')
+        print(f'Worker ingestion failed: HTTP {exc.code}: {body}', file=sys.stderr)
+        raise
 
 
-try:
-    products = download_products()
-    upload_products(products)
-    print('BOM ingestion complete.', flush=True)
-except Exception as exc:
-    print(f'BOM ingestion failed: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
-    raise SystemExit(1)
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print(f'BOM ingestion failed: {type(exc).__name__}: {exc}', file=sys.stderr)
+        raise

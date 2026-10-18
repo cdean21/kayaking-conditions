@@ -24,15 +24,14 @@ function assertBomProduct(xml, expectedId) {
 export function parseWarningProduct(xml, now = new Date()) {
   const meta = assertBomProduct(xml, 'IDV20600');
   const hazards = [...xml.matchAll(/<hazard\b([^>]*)>([\s\S]*?)<\/hazard>/gi)].map(([,attrs,body]) => {
-    const areas = [...body.matchAll(/<area\b([^>]*)\/?\s*>/gi)].map(([,a]) => ({aac:attr(a,'aac'),description:attr(a,'description'),type:attr(a,'type')})).filter(a=>a.aac);
+    const areas = [...body.matchAll(/<area\b([^>]*)\/?\s*>/gi)].map(([,a]) => ({aac:attr(a,'aac'),description:attr(a,'description'),type:attr(a,'type')}));
     return {type:attr(attrs,'type'),severity:attr(attrs,'severity'),phase:attr(attrs,'phase'),phenomena:textByType(body,'warning_phenomena'),warning_areas:textByType(body,'warning_areas'),areas};
   });
-  const uniqueHazards = [...new Map(hazards.map(h => [JSON.stringify([h.type,h.severity,h.phase,h.phenomena,h.warning_areas,h.areas]),h])).values()];
-  const relevant = uniqueHazards.filter(h => h.areas.some(a => a.aac === BOM_PORT_PHILLIP_AAC));
+  const relevant = hazards.filter(h => h.areas.some(a => a.aac === BOM_PORT_PHILLIP_AAC));
   const stale = now.getTime() > Date.parse(meta.expiry_at);
   return {
     source:'Bureau of Meteorology anonymous FTP — Victorian Marine Wind Warning Summary', product_id:'IDV20600', product_file:BOM_WARNING_PRODUCT,
-    ...meta, stale, hazard_count:uniqueHazards.length, relevant_hazards:relevant, statewide_hazards:uniqueHazards,
+    ...meta, stale, hazard_count:hazards.length, relevant_hazards:relevant, statewide_hazards:hazards,
     port_phillip_warning_active: relevant.length > 0,
     warning_gate: stale ? 'blocked_stale' : relevant.length ? 'blocked_active_warning' : 'pass_no_port_phillip_warning',
     full_warnings_url:BOM_MARINE_WARNINGS
@@ -51,18 +50,47 @@ export function parsePortPhillipForecast(xml, now = new Date()) {
   return {source:'Bureau of Meteorology anonymous FTP — Port Phillip Local Waters Forecast',product_id:'IDV10460',product_file:BOM_PORT_PHILLIP_PRODUCT,...meta,stale:now.getTime()>Date.parse(meta.expiry_at),area_aac:BOM_PORT_PHILLIP_AAC,area:'Port Phillip',periods};
 }
 
-export function buildOfficialMarineSnapshot(warningXml, forecastXml, now = new Date()) {
-  const warning = parseWarningProduct(warningXml, now);
+function verifiedNoWarningEvidence(evidence, now = new Date()) {
+  if (!evidence || evidence.status !== 'verified_no_current_victorian_marine_warning') throw new Error('IDV20600 absent without verified no-warning evidence');
+  if (evidence.state !== 'Victoria' || evidence.source_url !== BOM_MARINE_WARNINGS) throw new Error('Invalid Victorian marine warning evidence provenance');
+  const checked = iso(evidence.checked_at);
+  if (!checked) throw new Error('Invalid marine warning evidence timestamp');
+  const age = now.getTime() - Date.parse(checked);
+  if (age < -5 * 60 * 1000 || age > 30 * 60 * 1000) throw new Error('Marine warning evidence is not fresh');
+  return {
+    source:'Bureau of Meteorology Marine Warnings page',
+    product_id:'IDV20600',
+    product_file:BOM_WARNING_PRODUCT,
+    product_published:false,
+    checked_at:checked,
+    stale:false,
+    hazard_count:0,
+    relevant_hazards:[],
+    statewide_hazards:[],
+    port_phillip_warning_active:false,
+    warning_gate:'pass_verified_no_current_victorian_warning',
+    full_warnings_url:BOM_MARINE_WARNINGS,
+    evidence_status:evidence.status,
+    note:'IDV20600 was not published. The official BOM Marine Warnings page independently confirmed no current marine warnings for Victoria.'
+  };
+}
+
+export function buildOfficialMarineSnapshot(warningXml, forecastXml, now = new Date(), warningEvidence = null) {
+  const warning = typeof warningXml === 'string' && warningXml.trim()
+    ? parseWarningProduct(warningXml, now)
+    : verifiedNoWarningEvidence(warningEvidence, now);
   const forecast = parsePortPhillipForecast(forecastXml, now);
   const stale = warning.stale || forecast.stale;
   return {
     status: stale ? 'stale' : warning.port_phillip_warning_active ? 'warning_active' : 'verified_no_port_phillip_warning',
     fetched_at: now.toISOString(),
-    transport: 'BOM anonymous FTP via GitHub Actions',
+    transport: warning.product_published === false ? 'BOM anonymous FTP + official Marine Warnings page via GitHub Actions' : 'BOM anonymous FTP via GitHub Actions',
     warning,
     forecast,
     positive_alert_gate: stale ? 'blocked' : warning.port_phillip_warning_active ? 'blocked' : 'warning_check_passed',
-    note: 'Official BOM products were fetched by the scheduled GitHub ingestion job and validated by kayaking-conditions. This warning gate does not by itself verify Patterson River entrance or live launch conditions.'
+    note: warning.product_published === false
+      ? 'The Port Phillip forecast was fetched from BOM FTP; because IDV20600 was not published, the official BOM Marine Warnings page separately confirmed no current Victorian marine warning. This warning gate does not by itself verify Patterson River entrance or live launch conditions.'
+      : 'Official BOM products were fetched by the scheduled GitHub ingestion job and validated by kayaking-conditions. This warning gate does not by itself verify Patterson River entrance or live launch conditions.'
   };
 }
 
