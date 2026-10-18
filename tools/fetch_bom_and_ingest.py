@@ -51,7 +51,7 @@ def download_products():
 
             return products
 
-        except (ftplib.all_errors, OSError, UnicodeDecodeError, RuntimeError) as exc:
+        except ftplib.all_errors + (OSError, UnicodeDecodeError, RuntimeError) as exc:
             last_error = exc
             print(
                 f'BOM FTP attempt {attempt}/{MAX_ATTEMPTS} failed: '
