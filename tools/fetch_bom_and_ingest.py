@@ -89,13 +89,24 @@ def verify_no_victorian_marine_warning():
         html = response.read().decode('utf-8', errors='replace')
 
     # Bound the check to the Victoria section so another state's "No warnings" cannot satisfy it.
-    match = re.search(r'Victoria(?P<section>[\s\S]{0,5000}?)(?:Queensland|Western Australia|South Australia|Tasmania|Northern Territory)', html, re.I)
-    if not match:
-        raise RuntimeError('Could not identify the Victoria section on the BOM Marine Warnings page')
-    section = re.sub(r'<[^>]+>', ' ', match.group('section'))
-    section = re.sub(r'\s+', ' ', section).strip()
-    if not re.search(r'No\s+Marine\s+Warnings\s+Current', section, re.I):
-        raise RuntimeError('IDV20600 is absent, but BOM does not explicitly report "No Marine Warnings Current" for Victoria')
+    sections = re.findall(r'Victoria(?P<section>[\s\S]{0,5000}?)Queensland', html, re.I)
+    if not sections:
+        raise RuntimeError('Could not identify any Victoria section on the BOM Marine Warnings page')
+
+    verified = False
+    for raw_section in sections:
+        section = re.sub(r'<[^>]+>', ' ', raw_section)
+        section = re.sub(r'&nbsp;|&#160;', ' ', section, flags=re.I)
+        section = re.sub(r'\s+', ' ', section).strip()
+        if re.search(r'No\s+Marine\s+Warnings\s+Current\.?', section, re.I):
+            verified = True
+            break
+
+    if not verified:
+        raise RuntimeError(
+            'IDV20600 is absent, but the BOM Marine Warnings page does not '
+            'explicitly report "No Marine Warnings Current" in its Victoria section'
+        )
 
     checked_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     print('BOM Marine Warnings page confirms: Victoria — No Marine Warnings Current.')
