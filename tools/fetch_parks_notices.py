@@ -4,6 +4,9 @@ import datetime
 import json
 import os
 import re
+import socket
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -13,6 +16,12 @@ LIST = ROOT + '/mariners-notices'
 WORKER = os.environ.get('WORKER_URL', 'https://kayaking-conditions.delicate-meadow-3eb1.workers.dev').rstrip('/')
 PATH = re.compile(r'^/mariners-notices/20\d\d/\d\d/\d\d/', re.I)
 NUMBER = re.compile(r'(?i)\b(?:No\.?\s*)?(\d{1,4})\s*(\(T\))?\s*[-– ]\s*(20\d{2}|\d{2})\b')
+# Bound the whole scrape; a slow provider must not hang the scheduled job.
+SCRAPE_BUDGET_SECONDS = 10 * 60
+REQUEST_TIMEOUT_SECONDS = 35
+RETRY_DELAYS_SECONDS = (3, 8)
+STARTED_AT = time.monotonic()
+CACHE = {}
 LOCAL = re.compile(r'\b(?:Patterson\s+River|Carrum(?:\s+(?:Foreshore|Beach|Creek))?|Mordialloc(?:\s+Creek)?)\b', re.I)
 
 class Links(HTMLParser):
@@ -33,15 +42,55 @@ class Links(HTMLParser):
             self.items.append((self.href, ' '.join(''.join(self.buf).split())))
             self.href = None
 
+def remaining_budget():
+    remaining = SCRAPE_BUDGET_SECONDS - (time.monotonic() - STARTED_AT)
+    if remaining <= 0:
+        raise RuntimeError('Parks Victoria scrape exceeded 10-minute overall budget; refusing partial ingest')
+    return remaining
+
+
 def fetch(url):
+    if url in CACHE:
+        return CACHE[url]
+
     request = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (compatible; kayaking-conditions-notice-ingest/1.1)',
         'Accept': 'text/html',
     })
-    with urllib.request.urlopen(request, timeout=30) as response:
-        if response.status != 200:
-            raise RuntimeError(f'HTTP {response.status}: {url}')
-        return response.read(2_000_000).decode('utf-8', 'replace')
+    for attempt in range(1, len(RETRY_DELAYS_SECONDS) + 2):
+        timeout = min(REQUEST_TIMEOUT_SECONDS, remaining_budget())
+        print(f'GET {url} (attempt {attempt}/3, timeout {timeout:.0f}s)', flush=True)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if response.status != 200:
+                    raise RuntimeError(f'HTTP {response.status}: {url}')
+                body = response.read(2_000_001)
+                if len(body) > 2_000_000:
+                    raise RuntimeError(f'Oversized Parks Victoria response: {url}')
+                if not body:
+                    raise RuntimeError(f'Empty Parks Victoria response: {url}')
+                result = body.decode('utf-8', 'replace')
+                CACHE[url] = result
+                return result
+        except urllib.error.HTTPError as exc:
+            # Permanent client errors should not be retried. Rate limits and
+            # server errors may clear after a short pause.
+            if exc.code != 429 and not (500 <= exc.code <= 599):
+                raise RuntimeError(f'Parks Victoria HTTP {exc.code}: {url}') from exc
+            error = exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
+            error = exc
+        except RuntimeError:
+            # Empty/oversized/invalid responses are not transient network failures.
+            raise
+
+        print(f'Parks Victoria fetch failed: {type(error).__name__}: {error}', flush=True)
+        if attempt > len(RETRY_DELAYS_SECONDS):
+            raise RuntimeError(f'Parks Victoria fetch failed after 3 attempts: {url}') from error
+        delay = min(RETRY_DELAYS_SECONDS[attempt - 1], remaining_budget())
+        print(f'Retrying in {delay:.0f}s...', flush=True)
+        time.sleep(delay)
+
 
 def normalise(value):
     match = NUMBER.search(value)
@@ -124,6 +173,7 @@ def main():
 
     items = []
     for number, (url, label) in candidates.items():
+        remaining_budget()
         plain = text_from_html(fetch(url))
         # The listing's anchor label is just "No. 457 - 2026". The subject and
         # locality are on the detail page, so inspect the detail content.
@@ -157,6 +207,7 @@ def main():
     print(f'Found {len(selected)} relevant local/cancellation notices', flush=True)
     if not selected:
         raise RuntimeError('No local notices discovered; refuse silent clear')
+    remaining_budget()
     payload = json.dumps({
         'source': LIST,
         'coverage': 'recent_listing',
