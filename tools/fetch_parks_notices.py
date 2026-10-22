@@ -2,6 +2,7 @@
 """Fetch recent Parks Victoria NTMs. Recent pages are NOT a complete active-notice register."""
 import datetime
 import json
+from pathlib import Path
 import os
 import re
 import socket
@@ -22,6 +23,50 @@ REQUEST_TIMEOUT_SECONDS = 35
 RETRY_DELAYS_SECONDS = (3, 8)
 STARTED_AT = time.monotonic()
 CACHE = {}
+CACHE_FILE = Path(os.environ.get('PARKS_NOTICE_CACHE_FILE', '.cache/parks-notices/details.json'))
+CACHE_TTL_SECONDS = 24 * 60 * 60
+CACHE_SCHEMA = 1
+CACHE_DIRTY = False
+
+
+def load_detail_cache():
+    """Cache is only a bandwidth optimization, never evidence of a successful fetch."""
+    try:
+        data = json.loads(CACHE_FILE.read_text())
+        if data.get('schema') != CACHE_SCHEMA or not isinstance(data.get('pages'), dict):
+            raise ValueError('unsupported cache schema')
+        return data['pages']
+    except (OSError, ValueError, TypeError) as exc:
+        print(f'No usable previous detail cache ({exc}); full refresh', flush=True)
+        return {}
+
+
+DETAIL_CACHE = load_detail_cache()
+
+
+def detail_page(url, force_refresh=False):
+    global CACHE_DIRTY
+    if not force_refresh:
+        entry = DETAIL_CACHE.get(url)
+        if isinstance(entry, dict):
+            age = time.time() - entry.get('fetched_at', 0) if isinstance(entry.get('fetched_at'), (int, float)) else float('inf')
+            body = entry.get('html')
+            if 0 <= age < CACHE_TTL_SECONDS and isinstance(body, str) and body.strip() and len(body) <= 2_000_000:
+                return body, True
+    body = fetch(url)  # No stale-cache fallback when a required request fails.
+    DETAIL_CACHE[url] = {'fetched_at': time.time(), 'html': body}
+    CACHE_DIRTY = True
+    return body, False
+
+
+def save_detail_cache(urls):
+    # Only called AFTER the Worker has acknowledged the complete snapshot.
+    selected = {url: DETAIL_CACHE[url] for url in urls if url in DETAIL_CACHE}
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE_FILE.with_suffix('.tmp')
+    tmp.write_text(json.dumps({'schema': CACHE_SCHEMA, 'pages': selected}, separators=(',', ':')))
+    tmp.replace(CACHE_FILE)
+    print(f'Updated detail cache: {len(selected)} pages', flush=True)
 LOCAL = re.compile(r'\b(?:Patterson\s+River|Carrum(?:\s+(?:Foreshore|Beach|Creek))?|Mordialloc(?:\s+Creek)?)\b', re.I)
 
 class Links(HTMLParser):
@@ -172,9 +217,21 @@ def main():
     print(f'Discovered {len(candidates)} recent notices across paginated listing', flush=True)
 
     items = []
+    fetched = reused = refreshed_local = 0
     for number, (url, label) in candidates.items():
         remaining_budget()
-        plain = text_from_html(fetch(url))
+        # Always refresh previously local notices: changes to restrictions,
+        # cancellation language or details must not be hidden by caching.
+        prior = DETAIL_CACHE.get(url)
+        prior_html = prior.get('html', '') if isinstance(prior, dict) else ''
+        was_local = bool(LOCAL.search(text_from_html(prior_html)[:2500])) if prior_html else False
+        html, from_cache = detail_page(url, force_refresh=was_local)
+        if from_cache:
+            reused += 1
+        else:
+            fetched += 1
+            refreshed_local += int(was_local)
+        plain = text_from_html(html)
         # The listing's anchor label is just "No. 457 - 2026". The subject and
         # locality are on the detail page, so inspect the detail content.
         match = re.search(r'(?i)\bDetails\s*:', plain)
@@ -204,6 +261,7 @@ def main():
     relevant_numbers = {x['number'] for x in items if x['_relevant']}
     selected = [{k: v for k, v in x.items() if k != '_relevant'} for x in items
                 if x['_relevant'] or any(c in relevant_numbers for c in x['cancels'])]
+    print(f'Detail pages: {fetched} downloaded ({refreshed_local} previously local), {reused} reused from <24h cache', flush=True)
     print(f'Found {len(selected)} relevant local/cancellation notices', flush=True)
     if not selected:
         raise RuntimeError('No local notices discovered; refuse silent clear')
@@ -223,7 +281,12 @@ def main():
         },
     )
     with urllib.request.urlopen(request, timeout=30) as response:
-        print(response.read().decode())
+        response_body = response.read().decode()
+        print(response_body)
+        # Do not persist a cache if ingestion was rejected.
+        if response.status != 200 or not json.loads(response_body).get('ok'):
+            raise RuntimeError('Worker did not confirm successful Parks notice ingestion')
+    save_detail_cache([url for url, _ in candidates.values()])
 
 if __name__ == '__main__':
     main()

@@ -1,28 +1,36 @@
 name: Parks Victoria notice ingest
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: '18 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parks-notices-ingest
+  cancel-in-progress: true
 
 jobs:
   ingest:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - name: Restore prior notice detail cache
+        uses: actions/cache/restore@v4
         with:
-          python-version: "3.12"
-
-      - name: Fetch and ingest Parks Victoria notices
+          path: .cache/parks-notices/details.json
+          key: parks-notices-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            parks-notices-v1-
+      - name: Fetch Parks Victoria notices and ingest
         env:
           BOM_INGEST_TOKEN: ${{ secrets.BOM_INGEST_TOKEN }}
-          WORKER_URL: https://kayaking-conditions.delicate-meadow-3eb1.workers.dev
-        run: |
-          python tools/fetch_parks_notices.py \
-            --worker "$WORKER_URL" \
-            --token "$BOM_INGEST_TOKEN"
+        run: python3 tools/fetch_parks_notices.py
+      - name: Save validated notice detail cache
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/parks-notices/details.json
+          key: parks-notices-v1-${{ github.run_id }}-${{ github.run_attempt }}
